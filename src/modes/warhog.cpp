@@ -19,6 +19,7 @@
 #include "../core/sd_layout.h"
 #include "../core/flock_detect.h"
 #include "../core/flock_log.h"
+#include "../core/flock_proximity.h"
 #include "../audio/sfx.h"
 #include "../core/xp.h"
 #include "../ui/display.h"
@@ -282,6 +283,7 @@ void WarhogMode::start() {
     currentWigleFilename[0] = '\0';
     currentFlockFilename[0] = '\0';
     g_flock.setAlertThreshold(flockdet::Confidence::Medium);
+    flockprox::init();
 
     resetSeenTracking();
     seedCapturedFromOink();
@@ -452,6 +454,14 @@ void WarhogMode::update() {
         lastGPSState = hasGPSFix;
     }
     
+    // Proximity ramp against the known-ALPR map. Deliberately ahead of the
+    // scan-in-progress early return below so it keeps warning while the radio
+    // is busy — it is GPS-only and never touches WiFi.
+    {
+        GPSData gps = GPS::getData();
+        flockprox::update(gps.latitude, gps.longitude, hasGPSFix);
+    }
+
     // Distance tracking for XP (every 5 seconds when GPS is available)
     if (hasGPSFix && now - lastDistanceCheck >= 5000) {
         GPSData gps = GPS::getData();
