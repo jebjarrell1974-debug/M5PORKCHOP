@@ -65,6 +65,19 @@ static const int SD_RETRY_DELAY_MS = 10;
 // Files larger than this will be rotated to a new file
 static const size_t WIGLE_FILE_MAX_SIZE = 400000;
 
+// Radio time-slicing between WARHOG's active scan and NetworkRecon's
+// promiscuous listening. The two are mutually exclusive on the ESP32, and an
+// active scan only ever sees a camera that is currently beaconing — a sleeping
+// one is only visible as a receiver address in someone else's frame, which
+// needs promiscuous mode. So WARHOG takes turns: mostly scanning, with a short
+// listening window folded in. Tunable.
+static const uint32_t SCAN_SLICE_MS    = 8000;
+static const uint32_t PROMISC_SLICE_MS = 4000;
+
+enum class RadioSlice : uint8_t { ActiveScan, Promiscuous };
+static RadioSlice radioSlice = RadioSlice::ActiveScan;
+static uint32_t   sliceStartTime = 0;
+
 // Graceful stop request flag for background scan task
 static volatile bool stopRequested = false;
 // Set by scan task just before self-deleting, used for safe cleanup in stop()
@@ -299,9 +312,16 @@ void WarhogMode::start() {
     // Reset stop flag for clean start
     stopRequested = false;
 
-    // Stop NetworkRecon before WiFi manipulation (uses promiscuous mode, incompatible with STA scanning)
-    NetworkRecon::stop();
-    
+    // Park NetworkRecon rather than tearing it down: pause() drops promiscuous
+    // mode (which STA scanning cannot coexist with) but leaves the driver up,
+    // so the promiscuous slice in update() can resume() in ~50ms instead of
+    // paying a full start() — BLE deinit, WiFi re-init and all — every 12s.
+    NetworkRecon::start();
+    NetworkRecon::pause();
+
+    radioSlice = RadioSlice::ActiveScan;
+    sliceStartTime = millis();
+
     // Soft WiFi reset — keep driver alive to avoid esp_wifi_init() RX buffer failures
     WiFi.disconnect(false, true);  // Keep driver, erase AP credentials
     delay(200);             // Let it settle
@@ -338,6 +358,11 @@ void WarhogMode::start() {
 void WarhogMode::stop() {
     if (!running) return;
     
+    // Drop promiscuous before any WiFi teardown below; the NetworkRecon::start()
+    // at the end of this function resumes it for the next mode.
+    NetworkRecon::pause();
+    radioSlice = RadioSlice::ActiveScan;
+
     // Signal task to stop gracefully
     stopRequested = true;
     scanTaskExited = false;
@@ -507,6 +532,24 @@ void WarhogMode::update() {
         return;
     }
     
+    // Radio time-slice. Only reached with no scan in flight, so the handover
+    // never happens mid-scan.
+    if (radioSlice == RadioSlice::Promiscuous) {
+        if (now - sliceStartTime >= PROMISC_SLICE_MS) {
+            NetworkRecon::pause();          // promiscuous off, STA stays up
+            radioSlice = RadioSlice::ActiveScan;
+            sliceStartTime = now;
+        }
+        return;   // the radio belongs to NetworkRecon for this window
+    }
+
+    if (now - sliceStartTime >= SCAN_SLICE_MS) {
+        radioSlice = RadioSlice::Promiscuous;
+        sliceStartTime = now;
+        NetworkRecon::resume();             // live Flock detection + siren
+        return;
+    }
+
     // Start new scan if interval elapsed and not already scanning
     if (now - lastScanTime >= scanInterval) {
         performScan();
