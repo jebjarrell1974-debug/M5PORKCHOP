@@ -11,11 +11,15 @@
 //   - Raven BLE service UUIDs .................. deflock.me / community datasets
 //   - Crowdsourced camera locations ........... deflock.me (FoggedLens/deflock)
 //
-// NOTE: Before shipping, pull the *complete* 31-OUI table and the Raven
-// service-UUID values from the authoritative deflock.me dataset and confirm
-// that dataset's license permits redistribution. The table below intentionally
-// contains only the OUIs explicitly documented in public writeups, each tagged
-// with a vendor class so the detector can weight them correctly.
+// The OUI table below is the canonical field-tested 31-prefix set (30 from
+// @NitekryDPaul's research + 82:6B:F2 from DeFlockJoplin), as published in
+// colonelpanichacks/flock-you (oui.txt / datasets/NitekryDPaul_wifi_ouis.md).
+// Field results for that list: 11/12 cameras detected, 2 false positives.
+// Generic Espressif vendor blocks are deliberately NOT included -- they match
+// any ESP32 (including the Cardputer itself) and are false-positive machines.
+//
+// NOTE: the Raven service-UUID values still need to come from the authoritative
+// deflock.me dataset once its license permits redistribution.
 // ---------------------------------------------------------------------------
 #pragma once
 #include <stdint.h>
@@ -38,16 +42,41 @@ struct OuiEntry {
     const char* note;
 };
 
-// Only OUIs with public documentation are included. Extend from the
-// deflock.me dataset (with attribution) via community PRs.
+// The canonical 31. Every prefix here is Flock-specific enough to stand on its
+// own, so all are FLOCK_LINKED: an OUI match alone fires at Medium, and a
+// correlated wildcard probe request lifts it to High -- see the scorer.
 static const OuiEntry kFlockOuis[] = {
-    { {0xD4, 0xAD, 0xFC}, OuiClass::GENERIC_ESP,  "Espressif ESP32-S3"     },
-    { {0xAC, 0x67, 0xB2}, OuiClass::GENERIC_ESP,  "Espressif ESP32-WROOM"  },
-    { {0x84, 0xF3, 0xEB}, OuiClass::GENERIC_ESP,  "Espressif ESP32-S3 var" },
-    { {0xB4, 0xE6, 0x2D}, OuiClass::GENERIC_ESP,  "Espressif ESP32-C3"     },
-    { {0xCC, 0xDB, 0xA7}, OuiClass::GENERIC_ESP,  "Espressif"              },
-    { {0x82, 0x6B, 0xF2}, OuiClass::FLOCK_LINKED, "DeFlockJoplin 31st OUI" },
-    // TODO(community): append remaining OUIs from the deflock.me 31-OUI set.
+    { {0x70, 0xC9, 0x4E}, OuiClass::FLOCK_LINKED, "NitekryDPaul field list" },
+    { {0x3C, 0x91, 0x80}, OuiClass::FLOCK_LINKED, "NitekryDPaul field list" },
+    { {0xD8, 0xF3, 0xBC}, OuiClass::FLOCK_LINKED, "NitekryDPaul field list" },
+    { {0x80, 0x30, 0x49}, OuiClass::FLOCK_LINKED, "NitekryDPaul field list" },
+    { {0xB8, 0x35, 0x32}, OuiClass::FLOCK_LINKED, "NitekryDPaul field list" },
+    { {0x14, 0x5A, 0xFC}, OuiClass::FLOCK_LINKED, "NitekryDPaul field list" },
+    { {0x74, 0x4C, 0xA1}, OuiClass::FLOCK_LINKED, "NitekryDPaul field list" },
+    { {0x08, 0x3A, 0x88}, OuiClass::FLOCK_LINKED, "NitekryDPaul field list" },
+    { {0x9C, 0x2F, 0x9D}, OuiClass::FLOCK_LINKED, "NitekryDPaul field list" },
+    { {0xC0, 0x35, 0x32}, OuiClass::FLOCK_LINKED, "NitekryDPaul field list" },
+    { {0x94, 0x08, 0x53}, OuiClass::FLOCK_LINKED, "NitekryDPaul field list" },
+    { {0xE4, 0xAA, 0xEA}, OuiClass::FLOCK_LINKED, "NitekryDPaul field list" },
+    { {0xF4, 0x6A, 0xDD}, OuiClass::FLOCK_LINKED, "NitekryDPaul field list" },
+    { {0xF8, 0xA2, 0xD6}, OuiClass::FLOCK_LINKED, "NitekryDPaul field list" },
+    { {0x24, 0xB2, 0xB9}, OuiClass::FLOCK_LINKED, "NitekryDPaul field list" },
+    { {0x00, 0xF4, 0x8D}, OuiClass::FLOCK_LINKED, "NitekryDPaul field list" },
+    { {0xD0, 0x39, 0x57}, OuiClass::FLOCK_LINKED, "NitekryDPaul field list" },
+    { {0xE8, 0xD0, 0xFC}, OuiClass::FLOCK_LINKED, "NitekryDPaul field list" },
+    { {0xE0, 0x4F, 0x43}, OuiClass::FLOCK_LINKED, "NitekryDPaul field list" },
+    { {0xB8, 0x1E, 0xA4}, OuiClass::FLOCK_LINKED, "NitekryDPaul field list" },
+    { {0x70, 0x08, 0x94}, OuiClass::FLOCK_LINKED, "NitekryDPaul field list" },
+    { {0x58, 0x8E, 0x81}, OuiClass::FLOCK_LINKED, "NitekryDPaul field list" },
+    { {0xEC, 0x1B, 0xBD}, OuiClass::FLOCK_LINKED, "NitekryDPaul field list" },
+    { {0x3C, 0x71, 0xBF}, OuiClass::FLOCK_LINKED, "NitekryDPaul field list" },
+    { {0x58, 0x00, 0xE3}, OuiClass::FLOCK_LINKED, "NitekryDPaul field list" },
+    { {0x90, 0x35, 0xEA}, OuiClass::FLOCK_LINKED, "NitekryDPaul field list" },
+    { {0x5C, 0x93, 0xA2}, OuiClass::FLOCK_LINKED, "NitekryDPaul field list" },
+    { {0x64, 0x6E, 0x69}, OuiClass::FLOCK_LINKED, "NitekryDPaul field list" },
+    { {0x48, 0x27, 0xEA}, OuiClass::FLOCK_LINKED, "NitekryDPaul field list" },
+    { {0xA4, 0xCF, 0x12}, OuiClass::FLOCK_LINKED, "NitekryDPaul field list" },
+    { {0x82, 0x6B, 0xF2}, OuiClass::FLOCK_LINKED, "DeFlockJoplin 31st OUI"  },
 };
 static const uint8_t kFlockOuiCount = sizeof(kFlockOuis) / sizeof(kFlockOuis[0]);
 

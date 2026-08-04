@@ -13,6 +13,13 @@
 #include <esp_heap_caps.h>
 #include <NimBLEDevice.h>
 #include <atomic>
+#include <SD.h>
+#include "sd_layout.h"
+#include "flock_detect.h"
+#include "flock_log.h"
+#include "../gps/gps.h"
+#include "../audio/sfx.h"
+#include "../ui/display.h"
 
 namespace NetworkRecon {
 
@@ -100,6 +107,124 @@ static std::atomic<uint8_t> pendingSsidWrite{0};
 
 static std::atomic<PacketCallback> modeCallback{nullptr};
 static NewNetworkCallback newNetworkCallback = nullptr;
+
+// ============================================================================
+// FLOCK DETECTION (passive counter-surveillance)
+// Runs on every promiscuous frame while any passive mode (DO NO HAM / OINK /
+// SPECTRUM) is active. Detection is cheap and done in the packet callback;
+// the siren + GPS-tagged SD log are deferred to update() (main-loop context)
+// via a lock-free ring buffer, mirroring the pendingNetworks pattern.
+// ============================================================================
+static flockdet::FlockDetect g_flockDet;
+
+struct FlockHitRec {
+    uint8_t     mac[6];
+    int8_t      rssi;
+    uint8_t     channel;
+    uint8_t     kind;        // flockdet::DeviceKind
+    uint8_t     confidence;  // flockdet::Confidence
+    const char* reason;
+};
+static const uint8_t FLOCK_HIT_SLOTS = 8;
+static FlockHitRec flockHits[FLOCK_HIT_SLOTS];
+static std::atomic<uint8_t> flockHitWrite{0};
+static std::atomic<uint8_t> flockHitRead{0};
+
+static const uint8_t FLOCK_SEEN_MAX = 64;
+static uint8_t flockSeen[FLOCK_SEEN_MAX][6];
+static uint8_t flockSeenCount = 0;
+static char flockCsvFilename[128] = {0};
+
+// callback-safe: copy hit into ring buffer, no allocation/IO
+static inline void enqueueFlockHit(const flockdet::Detection& d) {
+    uint8_t w = flockHitWrite.load(std::memory_order_relaxed);
+    uint8_t nxt = (uint8_t)((w + 1) % FLOCK_HIT_SLOTS);
+    if (nxt == flockHitRead.load(std::memory_order_acquire)) return; // full: drop
+    FlockHitRec& r = flockHits[w];
+    memcpy(r.mac, d.mac, 6);
+    r.rssi = d.rssi;
+    r.channel = d.channel;
+    r.kind = (uint8_t)d.kind;
+    r.confidence = (uint8_t)d.confidence;
+    r.reason = d.reason;
+    flockHitWrite.store(nxt, std::memory_order_release);
+}
+
+static bool flockAlreadySeen(const uint8_t* mac) {
+    for (uint8_t i = 0; i < flockSeenCount; i++)
+        if (memcmp(flockSeen[i], mac, 6) == 0) return true;
+    return false;
+}
+static void flockMarkSeen(const uint8_t* mac) {
+    if (flockSeenCount < FLOCK_SEEN_MAX) memcpy(flockSeen[flockSeenCount++], mac, 6);
+}
+
+static bool ensureFlockFile() {
+    if (flockCsvFilename[0] != '\0') return true;
+    const char* dir = SDLayout::wardrivingDir();
+    if (!SD.exists(dir)) { if (!SD.mkdir(dir)) return false; }
+    GPSData g = GPS::getData();
+    if (g.date > 0 && g.time > 0) {
+        uint8_t day=g.date/10000, mon=(g.date/100)%100, yr=g.date%100;
+        uint8_t hh=g.time/1000000, mm=(g.time/10000)%100, ss=(g.time/100)%100;
+        snprintf(flockCsvFilename, sizeof(flockCsvFilename),
+                 "%s/flock_20%02d%02d%02d_%02d%02d%02d.csv", dir, yr,mon,day,hh,mm,ss);
+    } else {
+        snprintf(flockCsvFilename, sizeof(flockCsvFilename),
+                 "%s/flock_%lu.csv", dir, (unsigned long)millis());
+    }
+    File f = SD.open(flockCsvFilename, FILE_WRITE);
+    if (!f) { flockCsvFilename[0] = '\0'; return false; }
+    f.print(flockdet::flockCsvHeader());
+    f.close();
+    return true;
+}
+
+// main-loop context: de-dup, siren, GPS-tag, SD log for new hits
+static void drainFlockHits() {
+    while (flockHitRead.load(std::memory_order_relaxed) !=
+           flockHitWrite.load(std::memory_order_acquire)) {
+        uint8_t r = flockHitRead.load(std::memory_order_relaxed);
+        FlockHitRec rec = flockHits[r];
+        flockHitRead.store((uint8_t)((r + 1) % FLOCK_HIT_SLOTS), std::memory_order_release);
+
+        if (flockAlreadySeen(rec.mac)) continue;   // one alert per device per session
+        flockMarkSeen(rec.mac);
+
+        bool raven = (rec.kind == (uint8_t)flockdet::DeviceKind::RavenDetector);
+        Display::showToast(raven ? "RAVEN NEARBY" : "FLOCK CAM NEAR");
+        SFX::play(raven ? SFX::YOU_DIED : SFX::SIREN);
+
+        if (Config::isSDAvailable() && ensureFlockFile()) {
+            flockdet::Detection d;
+            d.kind = (flockdet::DeviceKind)rec.kind;
+            d.confidence = (flockdet::Confidence)rec.confidence;
+            memcpy(d.mac, rec.mac, 6);
+            d.rssi = rec.rssi; d.channel = rec.channel; d.reason = rec.reason;
+
+            flockdet::GpsFix fix;
+            GPSData g = GPS::getData();
+            if (g.latitude != 0.0 || g.longitude != 0.0) {
+                fix.lat = g.latitude; fix.lon = g.longitude;
+                fix.altM = (float)g.altitude;
+                fix.accM = (float)(g.hdop > 0 ? g.hdop * 5.0 : 10.0);
+                if (g.date > 0 && g.time > 0) {
+                    uint8_t day=g.date/10000, mon=(g.date/100)%100, yr=g.date%100;
+                    uint8_t hh=g.time/1000000, mm=(g.time/10000)%100, ss=(g.time/100)%100;
+                    snprintf(fix.utc, sizeof(fix.utc), "20%02d-%02d-%02dT%02d:%02d:%02dZ",
+                             yr,mon,day,hh,mm,ss);
+                    fix.valid = true;
+                }
+            }
+            char line[192];
+            int n = flockdet::flockCsvRow(line, sizeof(line), d, fix);
+            if (n > 0) {
+                File f = SD.open(flockCsvFilename, FILE_APPEND);
+                if (f) { f.print(line); f.close(); }
+            }
+        }
+    }
+}
 
 // ============================================================================
 // Internal Functions
@@ -601,6 +726,13 @@ static void promiscuousCallback(void* buf, wifi_promiscuous_pkt_type_t type) {
     
     const uint8_t* payload = pkt->payload;
     uint8_t frameSubtype = (payload[0] >> 4) & 0x0F;
+
+    // Passive Flock/Raven detection on every frame (cheap OUI check; siren and
+    // SD logging are deferred to drainFlockHits() in update()).
+    {
+        flockdet::Detection fd = g_flockDet.inspectWifiFrame(payload, len, rssi, currentChannel);
+        if (fd.hit()) enqueueFlockHit(fd);
+    }
     
     // Basic network tracking (always happens)
     switch (type) {
@@ -924,6 +1056,9 @@ void update() {
     
     // Process deferred events from callback
     processDeferredEvents();
+
+    // Fire siren + log for any Flock/Raven hits captured this cycle
+    drainFlockHits();
     
     // Channel hopping
     uint32_t hopInterval = getHopIntervalMsInternal();

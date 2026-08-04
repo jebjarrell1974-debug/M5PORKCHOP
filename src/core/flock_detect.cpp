@@ -28,6 +28,13 @@ inline bool ouiEq(const uint8_t* mac, const uint8_t* oui) {
     return mac[0] == oui[0] && mac[1] == oui[1] && mac[2] == oui[2];
 }
 
+// Group bit (I/G) set => broadcast or multicast destination, never a real
+// device address. addr1 is broadcast in every beacon/probe-request, so without
+// this guard the receiver-address trick would be pure noise.
+// NOTE: the locally-administered bit (0x02) is deliberately NOT filtered --
+// 82:6b:f2 is itself locally-administered and is an explicitly listed prefix.
+inline bool isGroupAddr(const uint8_t* mac) { return (mac[0] & 0x01) != 0; }
+
 // A wildcard (broadcast) probe request has an SSID element (id 0) of length 0
 // as the first tagged parameter. On its own this is a *very* common frame, so
 // it is only ever used here as corroboration, never as a standalone trigger.
@@ -54,8 +61,8 @@ Detection FlockDetect::inspectWifiFrame(const uint8_t* p, uint16_t len,
     const uint8_t* addr1 = p + 4;    // receiver  (the sleeping-camera trick)
     const uint8_t* addr2 = p + 10;   // transmitter
 
-    int i1 = matchOui(addr1);
-    int i2 = matchOui(addr2);
+    int i1 = isGroupAddr(addr1) ? -1 : matchOui(addr1);
+    int i2 = isGroupAddr(addr2) ? -1 : matchOui(addr2);
     if (i1 < 0 && i2 < 0) return d;  // no OUI of interest anywhere
 
     // Prefer the addr1/receiver match — that's the signature that catches
