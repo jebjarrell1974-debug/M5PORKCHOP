@@ -20,7 +20,7 @@
 #pragma once
 #include <stdint.h>
 
-namespace flock {
+namespace flockdet {
 
 // How trustworthy a given OUI is on its own.
 //   GENERIC_ESP  -> matches ANY Espressif device (incl. the Cardputer itself!).
@@ -76,4 +76,4 @@ static const BleServiceUuid128 kRavenServiceUuids[] = {
 static const uint8_t kRavenServiceUuidCount =
     sizeof(kRavenServiceUuids) / sizeof(kRavenServiceUuids[0]);
 
-} // namespace flock
+} // namespace flockdet

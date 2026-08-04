@@ -20,7 +20,7 @@
 #pragma once
 #include <stdint.h>
 
-namespace flock {
+namespace flockdet {
 
 enum class DeviceKind : uint8_t {
     None = 0,
@@ -74,6 +74,14 @@ public:
     Detection inspectBleAdv(const uint8_t* addr, const uint8_t* adv,
                             uint8_t advLen, int8_t rssi) const;
 
+    // Inspect one active-scan result (AP). WARHOG uses active scanning rather
+    // than promiscuous capture, so this path matches an AP's BSSID OUI against
+    // the Flock table and its SSID against name hints. Note: this only catches
+    // Flock gear that beacons as an AP; catching camera *client* MACs needs the
+    // promiscuous inspectWifiFrame() path above.
+    Detection inspectScanResult(const uint8_t* bssid, const char* ssid,
+                                int8_t rssi, uint8_t channel) const;
+
 private:
     Confidence threshold_ = Confidence::Medium;
 
@@ -81,4 +89,4 @@ private:
     static int matchOui(const uint8_t* mac);
 };
 
-} // namespace flock
+} // namespace flockdet

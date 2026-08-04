@@ -22,7 +22,7 @@
 #include <stdio.h>
 #include "flock_detect.h"
 
-namespace flock {
+namespace flockdet {
 
 // Minimal GPS fix the caller fills from WARHOG's existing GPS source.
 // utc is ISO-8601, e.g. "2026-02-14T18:03:07Z".
@@ -96,4 +96,4 @@ inline int wigleRow(char* buf, int bufLen, const Detection& d, const GpsFix& g) 
     return (n > 0 && n < bufLen) ? n : 0;
 }
 
-} // namespace flock
+} // namespace flockdet

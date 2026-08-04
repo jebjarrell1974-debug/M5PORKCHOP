@@ -7,7 +7,7 @@
 #include "flock_detect.h"
 #include "flock_signatures.h"
 
-namespace flock {
+namespace flockdet {
 
 // Forward declarations (defined at bottom of file).
 bool containsCI(const char* hay, uint8_t hayLen, const char* needle);
@@ -168,6 +168,50 @@ Detection FlockDetect::inspectBleAdv(const uint8_t* addr, const uint8_t* adv,
     return d;
 }
 
+Detection FlockDetect::inspectScanResult(const uint8_t* bssid, const char* ssid,
+                                         int8_t rssi, uint8_t channel) const {
+    Detection d;
+    if (!bssid) return d;
+
+    int idx = matchOui(bssid);
+
+    bool nameHit = false;
+    if (ssid) {
+        uint8_t len = 0;
+        while (ssid[len] && len < 64) ++len;
+        for (uint8_t h = 0; h < kFlockBleNameHintCount; ++h) {
+            if (containsCI(ssid, len, kFlockBleNameHints[h])) { nameHit = true; break; }
+        }
+    }
+
+    if (idx < 0 && !nameHit) return d;
+
+    Confidence conf = Confidence::Low;
+    const char* why = "ssid name hint";
+    DeviceKind  kind = DeviceKind::SuspectSurveillance;
+
+    if (idx >= 0) {
+        kind = DeviceKind::FlockCamera;
+        if (kFlockOuis[idx].cls == OuiClass::FLOCK_LINKED) {
+            conf = nameHit ? Confidence::High : Confidence::Medium;
+            why  = nameHit ? "flock OUI + SSID" : "flock OUI (AP)";
+        } else { // generic Espressif OUI on an AP: weak unless the SSID agrees
+            conf = nameHit ? Confidence::Medium : Confidence::Low;
+            why  = nameHit ? "esp OUI + flock SSID" : "esp OUI (AP, weak)";
+        }
+    }
+
+    if (conf < threshold_) return d;   // below the alert bar -> not reported
+
+    d.kind       = kind;
+    d.confidence = conf;
+    d.rssi       = rssi;
+    d.channel    = channel;
+    d.reason     = why;
+    for (int k = 0; k < 6; ++k) d.mac[k] = bssid[k];
+    return d;
+}
+
 // --- small helpers (kept out of the header for host-side testability) ------
 // case-insensitive substring search over a non-null-terminated buffer
 static inline char lc(char c){ return (c >= 'A' && c <= 'Z') ? c + 32 : c; }
@@ -187,4 +231,4 @@ bool uuid128Eq(const uint8_t* a, const uint8_t* b) {
     return true;
 }
 
-} // namespace flock
+} // namespace flockdet
