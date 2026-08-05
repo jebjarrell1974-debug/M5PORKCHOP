@@ -73,11 +73,16 @@ class GuardHogScanCallbacks : public NimBLEScanCallbacks {
         const std::vector<uint8_t>& pl = device->getPayload();
         if (pl.empty()) return;
 
-        // NimBLE stores the address little-endian (val[0] = LSB). Un-reverse to
+        // getAddress() returns a NimBLEAddress BY VALUE; getVal()/getBase() point
+        // INTO it, so it must stay alive while we read. Bind it to a named local
+        // (a bare `getAddress().getVal()` would dangle after the full expression).
+        // NimBLE stores the address little-endian (val[0] = LSB); un-reverse to
         // human display order so prefix matching + display tails are correct.
-        const uint8_t* le = device->getAddress().getBase()->val;
+        NimBLEAddress bleAddr = device->getAddress();
+        const uint8_t* le = bleAddr.getVal();
         uint8_t addr[6];
-        for (int i = 0; i < 6; ++i) addr[i] = le[5 - i];
+        if (le) { for (int i = 0; i < 6; ++i) addr[i] = le[5 - i]; }
+        else    { memset(addr, 0, 6); }
         int8_t rssi = (int8_t)device->getRSSI();
 
         uint8_t len = (pl.size() > 255) ? 255 : (uint8_t)pl.size();
@@ -152,6 +157,7 @@ void GuardHogMode::enterBleSlice() {
     startBleScan();
     radioPhase = RadioPhase::BleSlice;
     phaseStartMs = millis();
+    Serial.printf("[GH] -> BLE slice @ %lums\n", (unsigned long)phaseStartMs);
 }
 
 void GuardHogMode::enterWifiSlice() {
@@ -170,6 +176,7 @@ void GuardHogMode::enterWifiSlice() {
     radioPhase = RadioPhase::WifiSlice;
     phaseStartMs = millis();
     lastHopMs = phaseStartMs;
+    Serial.printf("[GH] -> WiFi slice @ %lums\n", (unsigned long)phaseStartMs);
 }
 
 void GuardHogMode::serviceWifiSlice(uint32_t now) {
@@ -192,8 +199,13 @@ void GuardHogMode::startBleScan() {
     pScan->setScanCallbacks(&g_scanCallbacks, false);
     pScan->setActiveScan(false);   // PASSIVE — never transmit scan requests
     pScan->setInterval(160);       // 100ms
-    pScan->setWindow(160);         // 100% duty for max catch
+    pScan->setWindow(150);         // window < interval (leave the radio breathing room)
     pScan->setDuplicateFilter(false);
+    // CRITICAL: callback-only. Without this, duplicateFilter(false) makes NimBLE
+    // stash every advertisement in its results vector, which grows unbounded
+    // through the 9s slice and exhausts heap (no PSRAM) -> crash a few seconds in.
+    // 0 = don't store results; we process entirely in onResult().
+    pScan->setMaxResults(0);
     pScan->start(0, false, true);  // duration=0 forever, non-blocking, continuous cb
     bleStarted = true;
 }
