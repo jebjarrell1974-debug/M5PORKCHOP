@@ -1,0 +1,83 @@
+// GUARD HOG - the DEFENSIVE SUITE watch face ("am I being watched?")
+// ---------------------------------------------------------------------------
+// Always-passive counter-surveillance mode. Built up across the phased
+// DEFENSIVE SUITE rollout:
+//   P1  BLE tracker scan (TICK CHECK) + GPS persistence (TAIL WAGGER)
+//   P4  drone Remote ID (SKY HOGS) + Flipper (FLIPPER FINDER) share the BLE scan
+//   P5  full CALM/SNIFFY/SPOOKED fusion + WiFi/BLE radio rotation
+//
+// RX-only. Owns the radio while active: it stops NetworkRecon, runs a NimBLE
+// passive scan, and (from P5) time-slices in WiFi like the WARHOG rotation.
+// ---------------------------------------------------------------------------
+#pragma once
+
+#include <Arduino.h>
+#include <M5Unified.h>
+#include "../defense/tracker_detect.h"
+
+class GuardHogMode {
+public:
+    static void start();
+    static void stop();
+    static void update();
+    static void draw(M5Canvas& canvas);
+    static bool isRunning() { return running; }
+
+    // Deferred BLE sighting handed over from the scan callback (callback-safe).
+    static void enqueueSighting(const uint8_t* addr, int8_t rssi,
+                                uint8_t trackerType, bool lost);
+
+private:
+    static bool running;
+
+    // ---- TICK CHECK: currently-visible trackers -----------------------------
+    static const uint8_t kMaxTrackers = 12;
+    struct TrackerEntry {
+        uint8_t  addr[6];
+        uint8_t  type;        // trackerdet::TrackerType
+        int8_t   rssi;
+        bool     lost;
+        uint32_t lastSeen;
+    };
+    static TrackerEntry trackers[kMaxTrackers];
+    static uint8_t trackerCount;
+
+    // ---- TAIL WAGGER: cross-waypoint persistence engine ---------------------
+    // A BLE MAC that keeps showing up as we move between GPS waypoints is a
+    // tail. Bounded fixed table with LRU eviction (no PSRAM on this board).
+    static const uint8_t  kMaxFollowers = 32;
+    static const uint16_t kWaypointMeters = 120;    // min move to count a new waypoint
+    static const uint8_t  kFollowWaypoints = 3;     // distinct waypoints to flag
+    static const uint8_t  kFollowHits = 3;          // min total sightings
+    static const uint32_t kFollowMinMs = 5UL * 60UL * 1000UL;  // over >=5 min
+    struct FollowEntry {
+        uint8_t  addr[6];
+        uint16_t hits;
+        uint8_t  waypoints;
+        bool     flagged;
+        bool     isTracker;
+        double   lastWpLat, lastWpLon;
+        uint32_t firstMs, lastMs;
+    };
+    static FollowEntry followers[kMaxFollowers];
+    static uint8_t followerCount;
+    static uint8_t followingFlagged;   // count of currently-flagged followers
+
+    // ---- deferred sighting ring (scan callback -> update) -------------------
+    static const uint8_t kSightSlots = 16;
+    struct Sighting { uint8_t addr[6]; int8_t rssi; uint8_t type; bool lost; };
+    static volatile Sighting sightRing[kSightSlots];
+    static volatile uint8_t sightWrite, sightRead;
+
+    // BLE lifecycle
+    static bool bleStarted;
+    static void startBleScan();
+    static void stopBleScan();
+
+    // engines
+    static void processSightings();
+    static void upsertTracker(const Sighting& s);
+    static void ageTrackers();
+    static void updateFollower(const Sighting& s);
+    static void logTrackerHit(const Sighting& s);
+};

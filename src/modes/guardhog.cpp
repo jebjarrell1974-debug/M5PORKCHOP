@@ -1,0 +1,363 @@
+// GUARD HOG - DEFENSIVE SUITE watch face. See guardhog.h.
+// Original code for M5PORKCHOP (MIT). Tracker signatures: tracker_detect.h.
+#include "guardhog.h"
+
+#include "../core/config.h"
+#include "../core/network_recon.h"
+#include "../core/sd_layout.h"
+#include "../gps/gps.h"
+#include "../audio/sfx.h"
+#include "../ui/display.h"
+#include "../piglet/avatar.h"
+
+#include <M5Cardputer.h>
+#include <NimBLEDevice.h>
+#include <WiFi.h>
+#include <SD.h>
+#include <math.h>
+#include <string.h>
+
+// ============================================================================
+// Static members
+// ============================================================================
+bool GuardHogMode::running = false;
+bool GuardHogMode::bleStarted = false;
+
+GuardHogMode::TrackerEntry GuardHogMode::trackers[GuardHogMode::kMaxTrackers];
+uint8_t GuardHogMode::trackerCount = 0;
+
+GuardHogMode::FollowEntry GuardHogMode::followers[GuardHogMode::kMaxFollowers];
+uint8_t GuardHogMode::followerCount = 0;
+uint8_t GuardHogMode::followingFlagged = 0;
+
+volatile GuardHogMode::Sighting GuardHogMode::sightRing[GuardHogMode::kSightSlots];
+volatile uint8_t GuardHogMode::sightWrite = 0;
+volatile uint8_t GuardHogMode::sightRead = 0;
+
+static const uint32_t TRACKER_STALE_MS = 30000;   // drop from list after 30s unseen
+static char ghLogFile[128] = {0};
+
+// ============================================================================
+// BLE scan callback (runs in NimBLE task context — keep it cheap)
+// ============================================================================
+class GuardHogScanCallbacks : public NimBLEScanCallbacks {
+    void onResult(const NimBLEAdvertisedDevice* device) override {
+        if (!device) return;
+        const std::vector<uint8_t>& pl = device->getPayload();
+        if (pl.empty()) return;
+
+        uint8_t addr[6];
+        memcpy(addr, device->getAddress().getBase()->val, 6);
+        int8_t rssi = (int8_t)device->getRSSI();
+
+        uint8_t len = (pl.size() > 255) ? 255 : (uint8_t)pl.size();
+        trackerdet::TrackerHit h = trackerdet::trackerInspectBleAdv(addr, pl.data(), len, rssi);
+
+        // Every sighting feeds TAIL WAGGER; trackers additionally light TICK CHECK.
+        GuardHogMode::enqueueSighting(addr, rssi, (uint8_t)h.type, h.lost);
+    }
+};
+static GuardHogScanCallbacks g_scanCallbacks;
+
+// ============================================================================
+// Lifecycle
+// ============================================================================
+void GuardHogMode::start() {
+    if (running) return;
+
+    trackerCount = 0;
+    followerCount = 0;
+    followingFlagged = 0;
+    sightWrite = sightRead = 0;
+    ghLogFile[0] = '\0';
+
+    // Take the radio: stop the WiFi promiscuous engine, power WiFi down so BLE
+    // gets a clean antenna (mirrors PIGGYBLUES).
+    NetworkRecon::stop();
+    WiFi.mode(WIFI_OFF);
+    delay(20);
+
+    startBleScan();
+
+    running = true;
+    Avatar::setState(AvatarState::HUNTING);
+    Display::notify(NoticeKind::STATUS, "GUARD HOG - WATCHING", 4000, NoticeChannel::TOP_BAR);
+}
+
+void GuardHogMode::stop() {
+    if (!running) return;
+    running = false;
+
+    stopBleScan();
+
+    // Give BLE back and restore the WiFi recon engine for other modes.
+    WiFi.mode(WIFI_STA);
+    delay(50);
+    NetworkRecon::start();
+    Avatar::setState(AvatarState::NEUTRAL);
+}
+
+void GuardHogMode::startBleScan() {
+    if (bleStarted) return;
+    if (!NimBLEDevice::isInitialized()) {
+        NimBLEDevice::init("");
+    }
+    NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+    NimBLEScan* pScan = NimBLEDevice::getScan();
+    if (!pScan) return;
+    pScan->setScanCallbacks(&g_scanCallbacks, false);
+    pScan->setActiveScan(false);   // PASSIVE — never transmit scan requests
+    pScan->setInterval(160);       // 100ms
+    pScan->setWindow(160);         // 100% duty for max catch
+    pScan->setDuplicateFilter(false);
+    pScan->start(0, false, true);  // duration=0 forever, non-blocking, continuous cb
+    bleStarted = true;
+}
+
+void GuardHogMode::stopBleScan() {
+    if (!bleStarted) return;
+    NimBLEScan* pScan = NimBLEDevice::getScan();
+    if (pScan) {
+        if (pScan->isScanning()) pScan->stop();
+        pScan->clearResults();
+    }
+    // Do NOT deinit NimBLE — ESP32-S3 is unhappy re-initing after deinit.
+    bleStarted = false;
+}
+
+// ============================================================================
+// Sighting ring (callback-safe enqueue)
+// ============================================================================
+void GuardHogMode::enqueueSighting(const uint8_t* addr, int8_t rssi,
+                                   uint8_t trackerType, bool lost) {
+    uint8_t w = sightWrite;
+    uint8_t nxt = (uint8_t)((w + 1) % kSightSlots);
+    if (nxt == sightRead) return;   // full: drop
+    for (int i = 0; i < 6; ++i) sightRing[w].addr[i] = addr[i];
+    sightRing[w].rssi = rssi;
+    sightRing[w].type = trackerType;
+    sightRing[w].lost = lost;
+    sightWrite = nxt;
+}
+
+// ============================================================================
+// Engines (main-loop context)
+// ============================================================================
+void GuardHogMode::update() {
+    if (!running) return;
+    processSightings();
+    ageTrackers();
+}
+
+void GuardHogMode::processSightings() {
+    while (sightRead != sightWrite) {
+        Sighting s;
+        uint8_t r = sightRead;
+        for (int i = 0; i < 6; ++i) s.addr[i] = sightRing[r].addr[i];
+        s.rssi = sightRing[r].rssi;
+        s.type = sightRing[r].type;
+        s.lost = sightRing[r].lost;
+        sightRead = (uint8_t)((r + 1) % kSightSlots);
+
+        bool isTracker = (s.type != (uint8_t)trackerdet::TrackerType::None);
+        if (isTracker) upsertTracker(s);
+        updateFollower(s);
+    }
+}
+
+void GuardHogMode::upsertTracker(const Sighting& s) {
+    uint32_t now = millis();
+    for (uint8_t i = 0; i < trackerCount; ++i) {
+        if (memcmp(trackers[i].addr, s.addr, 6) == 0) {
+            trackers[i].rssi = s.rssi;
+            trackers[i].lost = s.lost;
+            trackers[i].type = s.type;
+            trackers[i].lastSeen = now;
+            return;
+        }
+    }
+    // New tracker.
+    uint8_t slot;
+    if (trackerCount < kMaxTrackers) {
+        slot = trackerCount++;
+    } else {
+        // Replace the stalest.
+        slot = 0;
+        for (uint8_t i = 1; i < trackerCount; ++i)
+            if (trackers[i].lastSeen < trackers[slot].lastSeen) slot = i;
+    }
+    memcpy(trackers[slot].addr, s.addr, 6);
+    trackers[slot].rssi = s.rssi;
+    trackers[slot].lost = s.lost;
+    trackers[slot].type = s.type;
+    trackers[slot].lastSeen = now;
+
+    // Announce a freshly-seen tracker (soft grunt + toast); the loud alarm is
+    // reserved for a confirmed !FOLLOWING (TAIL WAGGER).
+    char toast[40];
+    snprintf(toast, sizeof(toast), "%s SEEN %02X%02X",
+             trackerdet::typeLabel((trackerdet::TrackerType)s.type), s.addr[4], s.addr[5]);
+    Display::showToast(toast);
+    SFX::play(SFX::PIG_GRUNT);
+    logTrackerHit(s);
+}
+
+void GuardHogMode::ageTrackers() {
+    uint32_t now = millis();
+    uint8_t w = 0;
+    for (uint8_t i = 0; i < trackerCount; ++i) {
+        if (now - trackers[i].lastSeen <= TRACKER_STALE_MS) {
+            if (w != i) trackers[w] = trackers[i];
+            ++w;
+        }
+    }
+    trackerCount = w;
+}
+
+// TAIL WAGGER: has this MAC followed us across enough distinct waypoints?
+void GuardHogMode::updateFollower(const Sighting& s) {
+    uint32_t now = millis();
+    GPSData g = GPS::getData();
+    bool haveFix = GPS::hasFix();
+
+    FollowEntry* e = nullptr;
+    for (uint8_t i = 0; i < followerCount; ++i) {
+        if (memcmp(followers[i].addr, s.addr, 6) == 0) { e = &followers[i]; break; }
+    }
+    if (!e) {
+        uint8_t slot;
+        if (followerCount < kMaxFollowers) {
+            slot = followerCount++;
+        } else {
+            // Evict the least-recently-seen unflagged entry.
+            slot = 0;
+            for (uint8_t i = 1; i < followerCount; ++i)
+                if (!followers[i].flagged && followers[i].lastMs < followers[slot].lastMs) slot = i;
+        }
+        e = &followers[slot];
+        memcpy(e->addr, s.addr, 6);
+        e->hits = 0;
+        e->waypoints = 0;
+        e->flagged = false;
+        e->isTracker = false;
+        e->lastWpLat = e->lastWpLon = 0.0;
+        e->firstMs = now;
+    }
+
+    e->hits++;
+    e->lastMs = now;
+    if (s.type != (uint8_t)trackerdet::TrackerType::None) e->isTracker = true;
+
+    // Count a distinct waypoint each time we've moved far enough since we last
+    // logged one for this MAC. Needs GPS; without a fix TAIL WAGGER just lists.
+    if (haveFix) {
+        if (e->waypoints == 0) {
+            e->waypoints = 1;
+            e->lastWpLat = g.latitude;
+            e->lastWpLon = g.longitude;
+        } else {
+            // equirectangular metres (same approx as flock_proximity)
+            const double R = 6371000.0, D2R = 0.017453292519943295;
+            double midLat = (e->lastWpLat + g.latitude) * 0.5 * D2R;
+            double x = (g.longitude - e->lastWpLon) * D2R * cos(midLat);
+            double y = (g.latitude - e->lastWpLat) * D2R;
+            double dist = sqrt(x * x + y * y) * R;
+            if (dist >= kWaypointMeters) {
+                if (e->waypoints < 255) e->waypoints++;
+                e->lastWpLat = g.latitude;
+                e->lastWpLon = g.longitude;
+            }
+        }
+    }
+
+    // Flag once: persistent across waypoints, enough hits, over enough time.
+    if (!e->flagged &&
+        e->waypoints >= kFollowWaypoints &&
+        e->hits >= kFollowHits &&
+        (now - e->firstMs) >= kFollowMinMs) {
+        e->flagged = true;
+        if (followingFlagged < 255) followingFlagged++;
+        Display::showToast("!FOLLOWING\nYOU'VE GOT A TAIL");
+        SFX::play(SFX::PIG_ALARM);
+        Avatar::setState(AvatarState::ANGRY);
+    }
+}
+
+void GuardHogMode::logTrackerHit(const Sighting& s) {
+    if (!Config::isSDAvailable()) return;
+    if (ghLogFile[0] == '\0') {
+        const char* dir = SDLayout::logsDir();
+        if (!SD.exists(dir)) { if (!SD.mkdir(dir)) return; }
+        GPSData g = GPS::getData();
+        if (g.date > 0 && g.time > 0) {
+            uint8_t day=g.date/10000, mon=(g.date/100)%100, yr=g.date%100;
+            uint8_t hh=g.time/1000000, mm=(g.time/10000)%100, ss=(g.time/100)%100;
+            snprintf(ghLogFile, sizeof(ghLogFile), "%s/guardhog_20%02d%02d%02d_%02d%02d%02d.csv",
+                     dir, yr,mon,day,hh,mm,ss);
+        } else {
+            snprintf(ghLogFile, sizeof(ghLogFile), "%s/guardhog_%lu.csv", dir, (unsigned long)millis());
+        }
+        File f = SD.open(ghLogFile, FILE_WRITE);
+        if (!f) { ghLogFile[0] = '\0'; return; }
+        f.print("ms,category,label,mac,rssi,lat,lon\n");
+        f.close();
+    }
+    GPSData g = GPS::getData();
+    char line[128];
+    snprintf(line, sizeof(line), "%lu,tracker,%s,%02X:%02X:%02X:%02X:%02X:%02X,%d,%.6f,%.6f\n",
+             (unsigned long)millis(), trackerdet::typeLabel((trackerdet::TrackerType)s.type),
+             s.addr[0],s.addr[1],s.addr[2],s.addr[3],s.addr[4],s.addr[5],
+             (int)s.rssi, g.latitude, g.longitude);
+    File f = SD.open(ghLogFile, FILE_APPEND);
+    if (f) { f.print(line); f.close(); }
+}
+
+// ============================================================================
+// Watch face
+// ============================================================================
+void GuardHogMode::draw(M5Canvas& canvas) {
+    const int W = canvas.width();
+    canvas.setTextFont(1);
+    canvas.setTextSize(1);
+
+    // Title
+    canvas.setTextColor(TFT_WHITE);
+    canvas.setCursor(4, 2);
+    canvas.print("GUARD HOG");
+    canvas.setTextColor(TFT_CYAN);
+    canvas.setCursor(W - 76, 2);
+    canvas.print("TICK CHECK");
+
+    // Follower banner takes priority
+    int y = 16;
+    if (followingFlagged > 0) {
+        canvas.fillRect(0, y, W, 14, TFT_RED);
+        canvas.setTextColor(TFT_WHITE);
+        canvas.setCursor(4, y + 3);
+        canvas.printf("!FOLLOWING  x%u  YOU'VE GOT A TAIL", followingFlagged);
+        y += 18;
+    }
+
+    // Tracker list
+    canvas.setTextColor(TFT_WHITE);
+    canvas.setCursor(4, y);
+    canvas.printf("trackers nearby: %u", trackerCount);
+    y += 12;
+
+    uint8_t shown = 0;
+    for (uint8_t i = 0; i < trackerCount && shown < 6; ++i, ++shown) {
+        const TrackerEntry& t = trackers[i];
+        canvas.setTextColor(t.lost ? TFT_ORANGE : TFT_GREENYELLOW);
+        canvas.setCursor(6, y);
+        canvas.printf("%-13s %4d  ..%02X%02X%s",
+                      trackerdet::typeLabel((trackerdet::TrackerType)t.type),
+                      (int)t.rssi, t.addr[4], t.addr[5], t.lost ? " LOST" : "");
+        y += 11;
+    }
+
+    if (trackerCount == 0 && followingFlagged == 0) {
+        canvas.setTextColor(TFT_DARKGREY);
+        canvas.setCursor(6, y + 4);
+        canvas.print("no ticks on you. good.");
+    }
+}
