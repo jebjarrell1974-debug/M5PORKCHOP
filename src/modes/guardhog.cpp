@@ -9,6 +9,8 @@
 #include "../audio/sfx.h"
 #include "../ui/display.h"
 #include "../piglet/avatar.h"
+#include "../piglet/mood.h"
+#include "../core/xp.h"
 
 #include <M5Cardputer.h>
 #include <NimBLEDevice.h>
@@ -45,6 +47,17 @@ WatchState GuardHogMode::watch = WatchState::Calm;
 
 static const uint32_t TRACKER_STALE_MS = 30000;   // drop from list after 30s unseen
 static char ghLogFile[128] = {0};
+
+// GUARD HOG "life" economy (named tuning constants; see mood.cpp for the decay
+// side). +1 happiness per completed BLE<->WiFi rotation (~17s) offsets the
+// reduced on-duty decay so idle nets ~break-even (a hair below zero).
+static const int GH_VIGILANCE_HAPPINESS = 1;
+
+// Award one dedup'd defensive catch: XP (visible bar bump) + a mood fatten-up.
+static inline void ghAwardCatch() {
+    XP::addXP(XP_DEFENSE_HIT);
+    Mood::onDefensiveCatch();
+}
 
 // ============================================================================
 // BLE scan callback (runs in NimBLE task context — keep it cheap)
@@ -120,6 +133,13 @@ void GuardHogMode::stop() {
 // the BT controller is still enabled aborts in coex_enable() (coredump-proven),
 // so each handoff fully tears the other radio down before enabling the next.
 void GuardHogMode::enterBleSlice() {
+    // Vigilance trickle: reaching a BLE slice FROM a WiFi slice means one full
+    // BLE<->WiFi rotation of guarding just completed. (The first entry from
+    // start() has radioPhase already BleSlice, so it doesn't award.)
+    if (radioPhase == RadioPhase::WifiSlice) {
+        Mood::adjustHappiness(GH_VIGILANCE_HAPPINESS);
+    }
+
     // Coming from the WiFi slice: stop WiFi promiscuous + free the WiFi driver so
     // the BT controller can own the radio.
     NetworkRecon::stop();
@@ -261,6 +281,9 @@ void GuardHogMode::computeWatch() {
             Display::showToast("SPOOKED\nTWO RADIOS AGREE");
             SFX::play(SFX::PIG_ALARM);
             Avatar::setState(AvatarState::ANGRY);
+            // A corroborated real threat is the best meal — bigger XP + fatten.
+            XP::addXP(XP_DEFENSE_SPOOKED);
+            Mood::onDefensiveCatch();
         } else if (s == WatchState::Sniffy) {
             Avatar::setState(AvatarState::EXCITED);
         } else {
@@ -290,6 +313,7 @@ void GuardHogMode::processSightings() {
             memcpy(droneSeen[droneCount++], s.addr, 6);
             Display::showToast("SKY HOG!\nDRONE REMOTE ID");
             SFX::play(SFX::PIG_ALARM);
+            ghAwardCatch();
         }
         // FLIPPER FINDER: another critter at the con.
         if (s.flipper && !seenContains(flipperSeen, flipperCount, s.addr) && flipperCount < kMaxSeen) {
@@ -298,6 +322,7 @@ void GuardHogMode::processSightings() {
             snprintf(toast, sizeof(toast), "FLIPPER NEAR #%u", flipperCount);
             Display::showToast(toast);
             SFX::play(SFX::PIG_GRUNT);
+            ghAwardCatch();
         }
     }
 }
@@ -337,6 +362,7 @@ void GuardHogMode::upsertTracker(const Sighting& s) {
     Display::showToast(toast);
     SFX::play(SFX::PIG_GRUNT);
     logTrackerHit(s);
+    ghAwardCatch();   // TICK CHECK: a freshly-seen tracker (deduped per MAC above)
 }
 
 void GuardHogMode::ageTrackers() {
@@ -417,6 +443,7 @@ void GuardHogMode::updateFollower(const Sighting& s) {
         Display::showToast("!FOLLOWING\nYOU'VE GOT A TAIL");
         SFX::play(SFX::PIG_ALARM);
         Avatar::setState(AvatarState::ANGRY);
+        ghAwardCatch();   // TAIL WAGGER: confirmed follower (flagged once per MAC)
     }
 }
 
@@ -517,4 +544,14 @@ void GuardHogMode::draw(M5Canvas& canvas) {
         canvas.setCursor(6, y + 2);
         canvas.print("no ticks on you. good.");
     }
+
+    // LIFE + XP readout, pinned to the bottom so the economy is visible: idle
+    // guarding holds LIFE ~flat, a catch bumps LIFE + the XP bar.
+    int life = Mood::getEffectiveHappiness();
+    canvas.setTextColor(life >= 0 ? TFT_GREEN : TFT_RED);
+    canvas.setCursor(4, canvas.height() - 10);
+    canvas.printf("LIFE %+d", life);
+    canvas.setTextColor(TFT_WHITE);
+    canvas.setCursor(canvas.width() - 92, canvas.height() - 10);
+    canvas.printf("XP L%u %u%%", XP::getLevel(), XP::getProgress());
 }

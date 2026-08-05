@@ -19,6 +19,8 @@
 #include "flock_log.h"
 #include "../defense/attack_detect.h"
 #include "../defense/eviltwin_detect.h"
+#include "xp.h"
+#include "../piglet/mood.h"
 #include "../gps/gps.h"
 #include "../audio/sfx.h"
 #include "../ui/display.h"
@@ -245,6 +247,9 @@ static void drainFlockHits() {
         bool raven = (rec.kind == (uint8_t)flockdet::DeviceKind::RavenDetector);
         Display::showToast(raven ? "RAVEN NEARBY" : "FLOCK CAM NEAR");
         SFX::play(raven ? SFX::PIG_RAVEN : SFX::PIG_ALARM);
+        // DEFENSIVE catch: a new camera/Raven (deduped per MAC above) — XP + fatten.
+        XP::addXP(XP_DEFENSE_HIT);
+        Mood::onDefensiveCatch();
 
         if (Config::isSDAvailable() && ensureFlockFile()) {
             flockdet::Detection d;
@@ -1320,6 +1325,16 @@ void serviceFlockAlerts() {
                      (unsigned)s.deauthPerSec, (unsigned)s.beaconPerSec);
             Display::showToast(toast);
             SFX::play(SFX::PIG_SQUEAL);
+            // DEFENSIVE catch: an active attack. Gated by a longer cooldown so a
+            // sustained flood can't farm XP (there's no per-device dedup for a
+            // flood). ATTACK_XP_COOLDOWN_MS is separate from the 5s toast gate.
+            static const uint32_t ATTACK_XP_COOLDOWN_MS = 30000;
+            static uint32_t lastAttackXpMs = 0;
+            if (lastAttackXpMs == 0 || nowA - lastAttackXpMs >= ATTACK_XP_COOLDOWN_MS) {
+                lastAttackXpMs = nowA;
+                XP::addXP(XP_DEFENSE_HIT);
+                Mood::onDefensiveCatch();
+            }
         }
     }
 
@@ -1341,6 +1356,9 @@ void serviceFlockAlerts() {
                      twin.impostorBssid[4], twin.impostorBssid[5]);
             Display::showToast(toast);
             SFX::play(SFX::PIG_ALARM);
+            // DEFENSIVE catch: a new evil twin (flagged once per SSID) — XP + fatten.
+            XP::addXP(XP_DEFENSE_HIT);
+            Mood::onDefensiveCatch();
         }
     }
 
