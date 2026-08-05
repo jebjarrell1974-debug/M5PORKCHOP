@@ -1382,6 +1382,50 @@ uint8_t getEvilTwinCount() {
     return g_evilTwinCount;
 }
 
+uint32_t getFlockAlertCount() {
+    return flockAlertCount.load(std::memory_order_relaxed);
+}
+
+// Run the passive defensive inspectors (flock + attack + evil-twin) on one raw
+// 802.11 frame, WITHOUT the full NetworkRecon network-tracking engine. GUARD HOG
+// calls this from its own short promiscuous slice so the WiFi-radio detectors
+// contribute to the fused score without tearing BLE down. Feeds the same static
+// monitors + rings that serviceFlockAlerts() drains on the main loop.
+void inspectDefenseFrame(const uint8_t* payload, uint16_t len, int8_t rssi, uint8_t channel) {
+    if (!payload || len < 24) return;
+    uint8_t fType = (payload[0] >> 2) & 0x03;
+    uint8_t fSub  = (payload[0] >> 4) & 0x0F;
+
+    flockdet::Detection fd = g_flockDet.inspectWifiFrame(payload, len, rssi, channel);
+    if (fd.hit()) {
+        flockMatchCount.fetch_add(1, std::memory_order_relaxed);
+        enqueueFlockHit(fd);
+    }
+
+    g_attackMon.onFrame(fType, fSub, (len >= 16) ? payload + 10 : nullptr);
+
+    // Beacon -> evil-twin. Use the capability privacy bit as the open/encrypted
+    // proxy (bit 4 of the capabilities field at body offset +10).
+    if (fType == 0 && fSub == 0x08 && len >= 38) {
+        const uint8_t* bssid = payload + 16;
+        uint16_t caps = (uint16_t)payload[34] | ((uint16_t)payload[35] << 8);
+        bool open = (caps & 0x0010) == 0;
+        char ssid[33] = {0};
+        uint16_t off = 36;
+        while (off + 2 <= len) {
+            uint8_t id = payload[off];
+            uint8_t ieLen = payload[off + 1];
+            if ((uint32_t)off + 2 + ieLen > len) break;
+            if (id == 0) {
+                if (ieLen > 0 && ieLen <= 32) { memcpy(ssid, payload + off + 2, ieLen); ssid[ieLen] = 0; }
+                break;
+            }
+            off += 2 + ieLen;
+        }
+        if (ssid[0]) enqueueApObs(ssid, bssid, open);
+    }
+}
+
 void setPacketCallback(PacketCallback callback) {
     modeCallback.store(callback, std::memory_order_release);
 }

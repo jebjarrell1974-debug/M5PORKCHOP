@@ -223,6 +223,16 @@ void clearLastAttack();
 /** FAKE BACON: running count of distinct evil-twin SSIDs flagged this session. */
 uint8_t getEvilTwinCount();
 
+/** Count of unique Flock/Raven devices alerted this session (for GUARD HOG). */
+uint32_t getFlockAlertCount();
+
+/**
+ * @brief Run flock + attack + evil-twin inspection on one raw 802.11 frame,
+ * without the full network-tracking engine. For GUARD HOG's own passive
+ * promiscuous slice (it owns the radio while NetworkRecon is stopped).
+ */
+void inspectDefenseFrame(const uint8_t* payload, uint16_t len, int8_t rssi, uint8_t channel);
+
 /**
  * @brief New network discovery callback type
  * Called from update() when a new network is added to the shared vector

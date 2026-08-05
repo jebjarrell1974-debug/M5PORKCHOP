@@ -13,6 +13,7 @@
 #include <M5Cardputer.h>
 #include <NimBLEDevice.h>
 #include <WiFi.h>
+#include <esp_wifi.h>
 #include <SD.h>
 #include <math.h>
 #include <string.h>
@@ -39,8 +40,29 @@ volatile GuardHogMode::Sighting GuardHogMode::sightRing[GuardHogMode::kSightSlot
 volatile uint8_t GuardHogMode::sightWrite = 0;
 volatile uint8_t GuardHogMode::sightRead = 0;
 
+GuardHogMode::RadioPhase GuardHogMode::radioPhase = GuardHogMode::RadioPhase::BleSlice;
+uint32_t GuardHogMode::phaseStartMs = 0;
+uint32_t GuardHogMode::lastHopMs = 0;
+bool GuardHogMode::wifiSniffing = false;
+WatchState GuardHogMode::watch = WatchState::Calm;
+
 static const uint32_t TRACKER_STALE_MS = 30000;   // drop from list after 30s unseen
 static char ghLogFile[128] = {0};
+
+// WiFi promiscuous slice: current hop channel + the rx callback.
+static const uint8_t GH_HOPS[] = {1, 6, 11};
+static uint8_t ghHopIdx = 0;
+static volatile uint8_t ghChannel = 1;
+
+static void ghPromiscCb(void* buf, wifi_promiscuous_pkt_type_t type) {
+    if (!buf) return;
+    if (type == WIFI_PKT_MISC) return;
+    const wifi_promiscuous_pkt_t* pkt = (const wifi_promiscuous_pkt_t*)buf;
+    uint16_t len = pkt->rx_ctrl.sig_len;
+    if (len > 4) len -= 4;   // strip ESP32 ghost FCS bytes
+    if (len < 24) return;
+    NetworkRecon::inspectDefenseFrame(pkt->payload, len, pkt->rx_ctrl.rssi, ghChannel);
+}
 
 // ============================================================================
 // BLE scan callback (runs in NimBLE task context — keep it cheap)
@@ -83,15 +105,17 @@ void GuardHogMode::start() {
     sightWrite = sightRead = 0;
     ghLogFile[0] = '\0';
 
-    // Take the radio: stop the WiFi promiscuous engine, power WiFi down so BLE
-    // gets a clean antenna (mirrors PIGGYBLUES).
+    watch = WatchState::Calm;
+
+    // Take the radio away from the background WiFi engine. GUARD HOG owns it and
+    // time-shares BLE/WiFi itself via the Eye-Spy rotation.
     NetworkRecon::stop();
     WiFi.mode(WIFI_OFF);
     delay(20);
 
-    startBleScan();
-
     running = true;
+    enterBleSlice();   // start in the BLE slice
+
     Avatar::setState(AvatarState::HUNTING);
     Display::notify(NoticeKind::STATUS, "GUARD HOG - WATCHING", 4000, NoticeChannel::TOP_BAR);
 }
@@ -100,6 +124,12 @@ void GuardHogMode::stop() {
     if (!running) return;
     running = false;
 
+    // Tear down whichever slice is live.
+    if (wifiSniffing) {
+        esp_wifi_set_promiscuous(false);
+        esp_wifi_set_promiscuous_rx_cb(nullptr);
+        wifiSniffing = false;
+    }
     stopBleScan();
 
     // Give BLE back and restore the WiFi recon engine for other modes.
@@ -107,6 +137,48 @@ void GuardHogMode::stop() {
     delay(50);
     NetworkRecon::start();
     Avatar::setState(AvatarState::NEUTRAL);
+}
+
+// ---- Eye-Spy radio rotation ------------------------------------------------
+void GuardHogMode::enterBleSlice() {
+    // Leave the WiFi slice if we were in it.
+    if (wifiSniffing) {
+        esp_wifi_set_promiscuous(false);
+        esp_wifi_set_promiscuous_rx_cb(nullptr);
+        wifiSniffing = false;
+    }
+    WiFi.mode(WIFI_OFF);
+    delay(10);
+    startBleScan();
+    radioPhase = RadioPhase::BleSlice;
+    phaseStartMs = millis();
+}
+
+void GuardHogMode::enterWifiSlice() {
+    // Stop the BLE scan (keep NimBLE initialised) and bring WiFi up passively.
+    stopBleScan();
+    WiFi.mode(WIFI_STA);
+    WiFi.disconnect(false, true);
+    delay(10);
+    ghHopIdx = 0;
+    ghChannel = GH_HOPS[0];
+    esp_wifi_set_promiscuous_rx_cb(ghPromiscCb);
+    esp_wifi_set_promiscuous_filter(nullptr);
+    esp_wifi_set_promiscuous(true);
+    esp_wifi_set_channel(ghChannel, WIFI_SECOND_CHAN_NONE);
+    wifiSniffing = true;
+    radioPhase = RadioPhase::WifiSlice;
+    phaseStartMs = millis();
+    lastHopMs = phaseStartMs;
+}
+
+void GuardHogMode::serviceWifiSlice(uint32_t now) {
+    if (now - lastHopMs >= WIFI_HOP_MS) {
+        ghHopIdx = (uint8_t)((ghHopIdx + 1) % (sizeof(GH_HOPS) / sizeof(GH_HOPS[0])));
+        ghChannel = GH_HOPS[ghHopIdx];
+        esp_wifi_set_channel(ghChannel, WIFI_SECOND_CHAN_NONE);
+        lastHopMs = now;
+    }
 }
 
 void GuardHogMode::startBleScan() {
@@ -166,8 +238,62 @@ bool GuardHogMode::seenContains(const uint8_t seen[][6], uint8_t n, const uint8_
 // ============================================================================
 void GuardHogMode::update() {
     if (!running) return;
+    uint32_t now = millis();
+
+    // BLE sightings are drained in every slice (the ring keeps filling during
+    // the BLE slice and is emptied here). WiFi-radio detections drain in the
+    // global serviceFlockAlerts() on the main loop.
     processSightings();
     ageTrackers();
+
+    // Eye-Spy rotation.
+    if (radioPhase == RadioPhase::BleSlice) {
+        if (now - phaseStartMs >= BLE_SLICE_MS) enterWifiSlice();
+    } else {
+        serviceWifiSlice(now);
+        if (now - phaseStartMs >= WIFI_SLICE_MS) enterBleSlice();
+    }
+
+    computeWatch();
+}
+
+// Fuse every detector into CALM / SNIFFY / SPOOKED. SPOOKED requires two
+// independent signals to agree — ideally one per radio (a WiFi Flock/attack/
+// evil-twin AND a BLE follower/drone), or two distinct WiFi attack signals.
+void GuardHogMode::computeWatch() {
+    // BLE-radio signals
+    bool bleStrong = (followingFlagged > 0) || (droneCount > 0);
+    bool bleWeak   = (trackerCount > 0) || (flipperCount > 0);
+
+    // WiFi-radio signals (accumulated by the shared detectors)
+    bool flock  = NetworkRecon::getFlockAlertCount() > 0;
+    bool attack = NetworkRecon::getLastAttack() != attackdet::AttackType::None;
+    bool twin   = NetworkRecon::getEvilTwinCount() > 0;
+    uint8_t wifiStrongCount = (uint8_t)flock + (uint8_t)attack + (uint8_t)twin;
+    bool wifiStrong = wifiStrongCount > 0;
+
+    WatchState s;
+    if ((bleStrong && wifiStrong) || wifiStrongCount >= 2) {
+        s = WatchState::Spooked;            // two independent signals agree
+    } else if (bleStrong || wifiStrong || bleWeak) {
+        s = WatchState::Sniffy;             // one signal — something's there
+    } else {
+        s = WatchState::Calm;
+    }
+
+    if (s != watch) {
+        WatchState prev = watch;
+        watch = s;
+        if (s == WatchState::Spooked && prev != WatchState::Spooked) {
+            Display::showToast("SPOOKED\nTWO RADIOS AGREE");
+            SFX::play(SFX::PIG_ALARM);
+            Avatar::setState(AvatarState::ANGRY);
+        } else if (s == WatchState::Sniffy) {
+            Avatar::setState(AvatarState::EXCITED);
+        } else {
+            Avatar::setState(AvatarState::HUNTING);
+        }
+    }
 }
 
 void GuardHogMode::processSightings() {
@@ -358,44 +484,64 @@ void GuardHogMode::draw(M5Canvas& canvas) {
     canvas.setTextFont(1);
     canvas.setTextSize(1);
 
-    // Title
+    // Title + which radio slice is live right now.
     canvas.setTextColor(TFT_WHITE);
     canvas.setCursor(4, 2);
     canvas.print("GUARD HOG");
-    canvas.setTextColor(TFT_CYAN);
-    canvas.setCursor(W - 76, 2);
-    canvas.print("TICK CHECK");
+    canvas.setTextColor(TFT_DARKGREY);
+    canvas.setCursor(W - 40, 2);
+    canvas.print(radioPhase == RadioPhase::BleSlice ? "[BLE]" : "[WiFi]");
 
-    // Follower banner takes priority
-    int y = 16;
+    // Fused mood banner — the headline.
+    uint16_t col; const char* word;
+    switch (watch) {
+        case WatchState::Spooked: col = TFT_RED;       word = "SPOOKED"; break;
+        case WatchState::Sniffy:  col = TFT_ORANGE;    word = "SNIFFY";  break;
+        default:                  col = TFT_DARKGREEN; word = "CALM";    break;
+    }
+    canvas.fillRect(0, 13, W, 20, col);
+    canvas.setTextColor(TFT_WHITE);
+    canvas.setTextSize(2);
+    canvas.setCursor(6, 15);
+    canvas.print(word);
+    canvas.setTextSize(1);
+    int y = 36;
+
     if (followingFlagged > 0) {
-        canvas.fillRect(0, y, W, 14, TFT_RED);
-        canvas.setTextColor(TFT_WHITE);
-        canvas.setCursor(4, y + 3);
-        canvas.printf("!FOLLOWING  x%u  YOU'VE GOT A TAIL", followingFlagged);
-        y += 18;
+        canvas.setTextColor(TFT_RED);
+        canvas.setCursor(4, y);
+        canvas.printf("!FOLLOWING x%u - YOU'VE GOT A TAIL", followingFlagged);
+        y += 12;
     }
 
-    // Counts row: trackers / drones / flippers
-    canvas.setTextColor(TFT_WHITE);
+    // Signal tallies across both radios.
+    canvas.setTextColor(TFT_CYAN);
     canvas.setCursor(4, y);
-    canvas.printf("ticks:%u  skyhogs:%u  flippers:%u", trackerCount, droneCount, flipperCount);
-    y += 12;
+    canvas.printf("BLE  tick:%u sky:%u flip:%u", trackerCount, droneCount, flipperCount);
+    y += 11;
+    canvas.setTextColor(TFT_YELLOW);
+    canvas.setCursor(4, y);
+    canvas.printf("WiFi cam:%lu atk:%s twin:%u",
+                  (unsigned long)NetworkRecon::getFlockAlertCount(),
+                  NetworkRecon::getLastAttack() != attackdet::AttackType::None ? "Y" : "-",
+                  NetworkRecon::getEvilTwinCount());
+    y += 13;
 
+    // A couple of the nearest trackers for context.
     uint8_t shown = 0;
-    for (uint8_t i = 0; i < trackerCount && shown < 6; ++i, ++shown) {
+    for (uint8_t i = 0; i < trackerCount && shown < 3; ++i, ++shown) {
         const TrackerEntry& t = trackers[i];
         canvas.setTextColor(t.lost ? TFT_ORANGE : TFT_GREENYELLOW);
         canvas.setCursor(6, y);
-        canvas.printf("%-13s %4d  ..%02X%02X%s",
+        canvas.printf("%-13s %4d ..%02X%02X%s",
                       trackerdet::typeLabel((trackerdet::TrackerType)t.type),
                       (int)t.rssi, t.addr[4], t.addr[5], t.lost ? " LOST" : "");
-        y += 11;
+        y += 10;
     }
 
-    if (trackerCount == 0 && followingFlagged == 0 && droneCount == 0 && flipperCount == 0) {
+    if (watch == WatchState::Calm) {
         canvas.setTextColor(TFT_DARKGREY);
-        canvas.setCursor(6, y + 4);
+        canvas.setCursor(6, y + 2);
         canvas.print("no ticks on you. good.");
     }
 }

@@ -17,6 +17,10 @@
 #include "../defense/drone_detect.h"
 #include "../defense/flipper_detect.h"
 
+// Fused "am I being watched?" score. SPOOKED only when two independent signals
+// (ideally across both radios) agree — no crying wolf.
+enum class WatchState : uint8_t { Calm = 0, Sniffy, Spooked };
+
 class GuardHogMode {
 public:
     static void start();
@@ -24,6 +28,7 @@ public:
     static void update();
     static void draw(M5Canvas& canvas);
     static bool isRunning() { return running; }
+    static WatchState watchState() { return watch; }
 
     // Deferred BLE sighting handed over from the scan callback (callback-safe).
     // `addr` is in human display order (addr[0] = first printed octet).
@@ -83,6 +88,28 @@ private:
     static volatile uint8_t sightWrite, sightRead;
 
     static bool seenContains(const uint8_t seen[][6], uint8_t n, const uint8_t* mac);
+
+    // ---- Eye-Spy radio rotation (P5) ---------------------------------------
+    // One 2.4GHz radio, time-shared. BLE slice: NimBLE passive scan, WiFi off.
+    // WiFi slice: BLE scan stopped, our own PASSIVE promiscuous sniff feeding
+    // NetworkRecon::inspectDefenseFrame (flock / attack / evil-twin). We keep
+    // NimBLE initialised the whole time (never deinit) to dodge the ESP32-S3
+    // re-init trap; only the SCAN starts/stops. No TX in either slice.
+    enum class RadioPhase : uint8_t { BleSlice = 0, WifiSlice };
+    static const uint32_t BLE_SLICE_MS  = 9000;
+    static const uint32_t WIFI_SLICE_MS = 8000;
+    static const uint32_t WIFI_HOP_MS   = 300;
+    static RadioPhase radioPhase;
+    static uint32_t   phaseStartMs;
+    static uint32_t   lastHopMs;
+    static bool       wifiSniffing;
+    static void enterBleSlice();
+    static void enterWifiSlice();
+    static void serviceWifiSlice(uint32_t now);
+
+    // ---- fused score --------------------------------------------------------
+    static WatchState watch;
+    static void computeWatch();
 
     // BLE lifecycle
     static bool bleStarted;
