@@ -220,6 +220,9 @@ const attackdet::AttackStats& getAttackStats();
 attackdet::AttackType getLastAttack();
 void clearLastAttack();
 
+/** FAKE BACON: running count of distinct evil-twin SSIDs flagged this session. */
+uint8_t getEvilTwinCount();
+
 /**
  * @brief New network discovery callback type
  * Called from update() when a new network is added to the shared vector

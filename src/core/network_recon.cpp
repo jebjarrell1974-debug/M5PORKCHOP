@@ -18,6 +18,7 @@
 #include "flock_detect.h"
 #include "flock_log.h"
 #include "../defense/attack_detect.h"
+#include "../defense/eviltwin_detect.h"
 #include "../gps/gps.h"
 #include "../audio/sfx.h"
 #include "../ui/display.h"
@@ -131,6 +132,30 @@ static flockdet::FlockDetect g_flockDet;
 static attackdet::AttackMonitor g_attackMon;
 static attackdet::AttackType    g_lastAttack = attackdet::AttackType::None;
 static uint32_t                 g_lastAttackAlertMs = 0;
+
+// FAKE BACON — evil-twin monitor. Fed a compact AP observation per newly-seen
+// beacon via a lock-free ring (callback-safe); the table logic + alert run on
+// the main loop in serviceFlockAlerts().
+static eviltwin::EvilTwinMonitor g_evilTwin;
+struct ApObs { char ssid[33]; uint8_t bssid[6]; uint8_t open; };
+static const uint8_t AP_OBS_SLOTS = 8;
+static ApObs apObsRing[AP_OBS_SLOTS];
+static std::atomic<uint8_t> apObsWrite{0};
+static std::atomic<uint8_t> apObsRead{0};
+static uint8_t g_evilTwinCount = 0;
+
+// callback-safe: copy an AP observation into the ring (no alloc/IO)
+static inline void enqueueApObs(const char* ssid, const uint8_t* bssid, bool open) {
+    if (!ssid || ssid[0] == '\0') return;   // skip hidden
+    uint8_t w = apObsWrite.load(std::memory_order_relaxed);
+    uint8_t nxt = (uint8_t)((w + 1) % AP_OBS_SLOTS);
+    if (nxt == apObsRead.load(std::memory_order_acquire)) return;  // full: drop
+    strncpy(apObsRing[w].ssid, ssid, 32);
+    apObsRing[w].ssid[32] = '\0';
+    memcpy(apObsRing[w].bssid, bssid, 6);
+    apObsRing[w].open = open ? 1 : 0;
+    apObsWrite.store(nxt, std::memory_order_release);
+}
 
 struct FlockHitRec {
     uint8_t     mac[6];
@@ -564,7 +589,13 @@ static void processBeacon(const uint8_t* payload, uint16_t len, int8_t rssi) {
         if (net.channel == 0) {
             net.channel = currentChannel;
         }
-        
+
+        // FAKE BACON: feed the evil-twin monitor one observation per new AP.
+        // We have a fully-parsed SSID + BSSID + auth here.
+        if (!net.isHidden) {
+            enqueueApObs(net.ssid, net.bssid, net.authmode == WIFI_AUTH_OPEN);
+        }
+
         // Queue for deferred add
         enqueuePendingNetwork(net);
     } else {
@@ -1292,6 +1323,27 @@ void serviceFlockAlerts() {
         }
     }
 
+    // FAKE BACON: drain AP observations and flag evil twins (security-mismatch
+    // clones of a known SSID). Table + alert live here on the main loop.
+    while (apObsRead.load(std::memory_order_relaxed) != apObsWrite.load(std::memory_order_acquire)) {
+        uint8_t r = apObsRead.load(std::memory_order_relaxed);
+        ApObs obs = apObsRing[r];
+        apObsRead.store((uint8_t)((r + 1) % AP_OBS_SLOTS), std::memory_order_release);
+
+        eviltwin::TwinHit twin;
+        eviltwin::Sec sec = obs.open ? eviltwin::Sec::Open : eviltwin::Sec::Encrypted;
+        if (g_evilTwin.observe(obs.ssid, obs.bssid, sec, twin)) {
+            g_evilTwinCount = g_evilTwin.twinCount();
+            char toast[80];
+            snprintf(toast, sizeof(toast), "FAKE BACON!\n%s NOW %s\n%02X%02X vs %02X%02X",
+                     twin.ssid, twin.impostorSec == eviltwin::Sec::Open ? "OPEN" : "ENC",
+                     twin.baselineBssid[4], twin.baselineBssid[5],
+                     twin.impostorBssid[4], twin.impostorBssid[5]);
+            Display::showToast(toast);
+            SFX::play(SFX::PIG_ALARM);
+        }
+    }
+
 #if FLOCK_DEBUG_COUNTERS
     // [TEMP DEBUG — strip once DNH confirmed] print the pipeline counters ~3s,
     // and only when something changed, so the log isn't spammed.
@@ -1324,6 +1376,10 @@ attackdet::AttackType getLastAttack() {
 
 void clearLastAttack() {
     g_lastAttack = attackdet::AttackType::None;
+}
+
+uint8_t getEvilTwinCount() {
+    return g_evilTwinCount;
 }
 
 void setPacketCallback(PacketCallback callback) {
