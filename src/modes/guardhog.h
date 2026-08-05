@@ -14,6 +14,8 @@
 #include <Arduino.h>
 #include <M5Unified.h>
 #include "../defense/tracker_detect.h"
+#include "../defense/drone_detect.h"
+#include "../defense/flipper_detect.h"
 
 class GuardHogMode {
 public:
@@ -24,8 +26,10 @@ public:
     static bool isRunning() { return running; }
 
     // Deferred BLE sighting handed over from the scan callback (callback-safe).
+    // `addr` is in human display order (addr[0] = first printed octet).
     static void enqueueSighting(const uint8_t* addr, int8_t rssi,
-                                uint8_t trackerType, bool lost);
+                                uint8_t trackerType, bool lost,
+                                bool drone, bool flipper);
 
 private:
     static bool running;
@@ -63,11 +67,22 @@ private:
     static uint8_t followerCount;
     static uint8_t followingFlagged;   // count of currently-flagged followers
 
+    // ---- SKY HOGS / FLIPPER FINDER: distinct-MAC tallies --------------------
+    static const uint8_t kMaxSeen = 8;
+    static uint8_t droneSeen[kMaxSeen][6];
+    static uint8_t droneCount;
+    static uint8_t flipperSeen[kMaxSeen][6];
+    static uint8_t flipperCount;
+
     // ---- deferred sighting ring (scan callback -> update) -------------------
-    static const uint8_t kSightSlots = 16;
-    struct Sighting { uint8_t addr[6]; int8_t rssi; uint8_t type; bool lost; };
+    static const uint8_t kSightSlots = 24;
+    struct Sighting {
+        uint8_t addr[6]; int8_t rssi; uint8_t type; bool lost; bool drone; bool flipper;
+    };
     static volatile Sighting sightRing[kSightSlots];
     static volatile uint8_t sightWrite, sightRead;
+
+    static bool seenContains(const uint8_t seen[][6], uint8_t n, const uint8_t* mac);
 
     // BLE lifecycle
     static bool bleStarted;

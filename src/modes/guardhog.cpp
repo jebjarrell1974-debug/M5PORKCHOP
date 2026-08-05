@@ -30,6 +30,11 @@ GuardHogMode::FollowEntry GuardHogMode::followers[GuardHogMode::kMaxFollowers];
 uint8_t GuardHogMode::followerCount = 0;
 uint8_t GuardHogMode::followingFlagged = 0;
 
+uint8_t GuardHogMode::droneSeen[GuardHogMode::kMaxSeen][6];
+uint8_t GuardHogMode::droneCount = 0;
+uint8_t GuardHogMode::flipperSeen[GuardHogMode::kMaxSeen][6];
+uint8_t GuardHogMode::flipperCount = 0;
+
 volatile GuardHogMode::Sighting GuardHogMode::sightRing[GuardHogMode::kSightSlots];
 volatile uint8_t GuardHogMode::sightWrite = 0;
 volatile uint8_t GuardHogMode::sightRead = 0;
@@ -46,15 +51,20 @@ class GuardHogScanCallbacks : public NimBLEScanCallbacks {
         const std::vector<uint8_t>& pl = device->getPayload();
         if (pl.empty()) return;
 
+        // NimBLE stores the address little-endian (val[0] = LSB). Un-reverse to
+        // human display order so prefix matching + display tails are correct.
+        const uint8_t* le = device->getAddress().getBase()->val;
         uint8_t addr[6];
-        memcpy(addr, device->getAddress().getBase()->val, 6);
+        for (int i = 0; i < 6; ++i) addr[i] = le[5 - i];
         int8_t rssi = (int8_t)device->getRSSI();
 
         uint8_t len = (pl.size() > 255) ? 255 : (uint8_t)pl.size();
-        trackerdet::TrackerHit h = trackerdet::trackerInspectBleAdv(addr, pl.data(), len, rssi);
+        trackerdet::TrackerHit t = trackerdet::trackerInspectBleAdv(addr, pl.data(), len, rssi);
+        dronedet::DroneHit     d = dronedet::droneInspectBleAdv(addr, pl.data(), len, rssi);
+        flipperdet::FlipperHit f = flipperdet::flipperInspect(addr, pl.data(), len, rssi);
 
-        // Every sighting feeds TAIL WAGGER; trackers additionally light TICK CHECK.
-        GuardHogMode::enqueueSighting(addr, rssi, (uint8_t)h.type, h.lost);
+        // Every sighting feeds TAIL WAGGER; typed hits light their detectors.
+        GuardHogMode::enqueueSighting(addr, rssi, (uint8_t)t.type, t.lost, d.hit(), f.hit());
     }
 };
 static GuardHogScanCallbacks g_scanCallbacks;
@@ -68,6 +78,8 @@ void GuardHogMode::start() {
     trackerCount = 0;
     followerCount = 0;
     followingFlagged = 0;
+    droneCount = 0;
+    flipperCount = 0;
     sightWrite = sightRead = 0;
     ghLogFile[0] = '\0';
 
@@ -129,7 +141,8 @@ void GuardHogMode::stopBleScan() {
 // Sighting ring (callback-safe enqueue)
 // ============================================================================
 void GuardHogMode::enqueueSighting(const uint8_t* addr, int8_t rssi,
-                                   uint8_t trackerType, bool lost) {
+                                   uint8_t trackerType, bool lost,
+                                   bool drone, bool flipper) {
     uint8_t w = sightWrite;
     uint8_t nxt = (uint8_t)((w + 1) % kSightSlots);
     if (nxt == sightRead) return;   // full: drop
@@ -137,7 +150,15 @@ void GuardHogMode::enqueueSighting(const uint8_t* addr, int8_t rssi,
     sightRing[w].rssi = rssi;
     sightRing[w].type = trackerType;
     sightRing[w].lost = lost;
+    sightRing[w].drone = drone;
+    sightRing[w].flipper = flipper;
     sightWrite = nxt;
+}
+
+bool GuardHogMode::seenContains(const uint8_t seen[][6], uint8_t n, const uint8_t* mac) {
+    for (uint8_t i = 0; i < n; ++i)
+        if (memcmp(seen[i], mac, 6) == 0) return true;
+    return false;
 }
 
 // ============================================================================
@@ -157,11 +178,28 @@ void GuardHogMode::processSightings() {
         s.rssi = sightRing[r].rssi;
         s.type = sightRing[r].type;
         s.lost = sightRing[r].lost;
+        s.drone = sightRing[r].drone;
+        s.flipper = sightRing[r].flipper;
         sightRead = (uint8_t)((r + 1) % kSightSlots);
 
         bool isTracker = (s.type != (uint8_t)trackerdet::TrackerType::None);
         if (isTracker) upsertTracker(s);
         updateFollower(s);
+
+        // SKY HOGS: a drone announcing Remote ID nearby.
+        if (s.drone && !seenContains(droneSeen, droneCount, s.addr) && droneCount < kMaxSeen) {
+            memcpy(droneSeen[droneCount++], s.addr, 6);
+            Display::showToast("SKY HOG!\nDRONE REMOTE ID");
+            SFX::play(SFX::PIG_ALARM);
+        }
+        // FLIPPER FINDER: another critter at the con.
+        if (s.flipper && !seenContains(flipperSeen, flipperCount, s.addr) && flipperCount < kMaxSeen) {
+            memcpy(flipperSeen[flipperCount++], s.addr, 6);
+            char toast[40];
+            snprintf(toast, sizeof(toast), "FLIPPER NEAR #%u", flipperCount);
+            Display::showToast(toast);
+            SFX::play(SFX::PIG_GRUNT);
+        }
     }
 }
 
@@ -338,10 +376,10 @@ void GuardHogMode::draw(M5Canvas& canvas) {
         y += 18;
     }
 
-    // Tracker list
+    // Counts row: trackers / drones / flippers
     canvas.setTextColor(TFT_WHITE);
     canvas.setCursor(4, y);
-    canvas.printf("trackers nearby: %u", trackerCount);
+    canvas.printf("ticks:%u  skyhogs:%u  flippers:%u", trackerCount, droneCount, flipperCount);
     y += 12;
 
     uint8_t shown = 0;
@@ -355,7 +393,7 @@ void GuardHogMode::draw(M5Canvas& canvas) {
         y += 11;
     }
 
-    if (trackerCount == 0 && followingFlagged == 0) {
+    if (trackerCount == 0 && followingFlagged == 0 && droneCount == 0 && flipperCount == 0) {
         canvas.setTextColor(TFT_DARKGREY);
         canvas.setCursor(6, y + 4);
         canvas.print("no ticks on you. good.");
