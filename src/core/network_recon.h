@@ -6,6 +6,7 @@
 #include <Arduino.h>
 #include <esp_wifi.h>
 #include <vector>
+#include "../defense/attack_detect.h"
 
 // Maximum networks to track
 #define MAX_RECON_NETWORKS 200
@@ -209,6 +210,15 @@ void setPacketCallback(PacketCallback callback);
  * Cheap when there is nothing to drain.
  */
 void serviceFlockAlerts();
+
+/**
+ * @brief SQUEAL ALERT accessors — the passive 802.11 attack monitor fed by the
+ * shared promiscuous path. Per-second stats + the latest crossed threshold, for
+ * GUARD HOG's fused watch face. clearLastAttack() acks the sticky flag.
+ */
+const attackdet::AttackStats& getAttackStats();
+attackdet::AttackType getLastAttack();
+void clearLastAttack();
 
 /**
  * @brief New network discovery callback type

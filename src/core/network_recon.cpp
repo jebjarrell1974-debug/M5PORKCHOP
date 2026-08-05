@@ -17,6 +17,7 @@
 #include "sd_layout.h"
 #include "flock_detect.h"
 #include "flock_log.h"
+#include "../defense/attack_detect.h"
 #include "../gps/gps.h"
 #include "../audio/sfx.h"
 #include "../ui/display.h"
@@ -124,6 +125,12 @@ static NewNetworkCallback newNetworkCallback = nullptr;
 // via a lock-free ring buffer, mirroring the pendingNetworks pattern.
 // ============================================================================
 static flockdet::FlockDetect g_flockDet;
+
+// SQUEAL ALERT — passive 802.11 attack monitor, fed from promiscuousCallback,
+// rolled + alerted from serviceFlockAlerts() on the main loop.
+static attackdet::AttackMonitor g_attackMon;
+static attackdet::AttackType    g_lastAttack = attackdet::AttackType::None;
+static uint32_t                 g_lastAttackAlertMs = 0;
 
 struct FlockHitRec {
     uint8_t     mac[6];
@@ -744,6 +751,7 @@ static void promiscuousCallback(void* buf, wifi_promiscuous_pkt_type_t type) {
     packetCount.fetch_add(1, std::memory_order_relaxed);
     
     const uint8_t* payload = pkt->payload;
+    uint8_t frameType    = (payload[0] >> 2) & 0x03;
     uint8_t frameSubtype = (payload[0] >> 4) & 0x0F;
 
     // Passive Flock/Raven detection on every frame (cheap OUI check; siren and
@@ -755,6 +763,11 @@ static void promiscuousCallback(void* buf, wifi_promiscuous_pkt_type_t type) {
             enqueueFlockHit(fd);
         }
     }
+
+    // SQUEAL ALERT: passive 802.11 attack counters (deauth/disassoc/beacon/probe
+    // floods). addr2 (payload+10) is the transmitter. Per-second roll-up + alert
+    // happen in serviceFlockAlerts() on the main loop.
+    g_attackMon.onFrame(frameType, frameSubtype, (len >= 16) ? payload + 10 : nullptr);
     
     // Basic network tracking (always happens)
     switch (type) {
@@ -1261,6 +1274,24 @@ void setChannel(uint8_t channel) {
 void serviceFlockAlerts() {
     drainFlockHits();
 
+    // SQUEAL ALERT: roll the attack window and squeal (rate-limited) when the
+    // air turns hostile. Mode-independent, same as the flock drain.
+    uint32_t nowA = millis();
+    attackdet::AttackType atk = g_attackMon.tick(nowA);
+    if (atk != attackdet::AttackType::None) {
+        g_lastAttack = atk;
+        if (nowA - g_lastAttackAlertMs >= 5000) {   // don't squeal every second
+            g_lastAttackAlertMs = nowA;
+            const attackdet::AttackStats& s = g_attackMon.stats();
+            char toast[64];
+            snprintf(toast, sizeof(toast), "SQUEAL: %s\n%02X%02X d%u b%u",
+                     attackdet::attackLabel(atk), s.lastBssid[4], s.lastBssid[5],
+                     (unsigned)s.deauthPerSec, (unsigned)s.beaconPerSec);
+            Display::showToast(toast);
+            SFX::play(SFX::PIG_SQUEAL);
+        }
+    }
+
 #if FLOCK_DEBUG_COUNTERS
     // [TEMP DEBUG — strip once DNH confirmed] print the pipeline counters ~3s,
     // and only when something changed, so the log isn't spammed.
@@ -1281,6 +1312,18 @@ void serviceFlockAlerts() {
         lastPrint = now;
     }
 #endif
+}
+
+const attackdet::AttackStats& getAttackStats() {
+    return g_attackMon.stats();
+}
+
+attackdet::AttackType getLastAttack() {
+    return g_lastAttack;
+}
+
+void clearLastAttack() {
+    g_lastAttack = attackdet::AttackType::None;
 }
 
 void setPacketCallback(PacketCallback callback) {
