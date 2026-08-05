@@ -21,6 +21,14 @@
 #include "../audio/sfx.h"
 #include "../ui/display.h"
 
+// Serial-print the flock pipeline counters (match/enqueue/drain/alert) from
+// serviceFlockAlerts() for bring-up. Off by default now DNH is confirmed;
+// flip to 1 to diagnose a silent detector. The atomic counters themselves stay
+// live (they're cheap) so GUARD HOG and future diagnostics can read them.
+#ifndef FLOCK_DEBUG_COUNTERS
+#define FLOCK_DEBUG_COUNTERS 0
+#endif
+
 namespace NetworkRecon {
 
 // ============================================================================
@@ -135,11 +143,20 @@ static uint8_t flockSeen[FLOCK_SEEN_MAX][6];
 static uint8_t flockSeenCount = 0;
 static char flockCsvFilename[128] = {0};
 
+// [TEMP DEBUG — strip once DNH confirmed] counters to prove enqueue vs drain.
+// enqueue climbs but drain stays 0  => drain path never runs in this mode.
+// enqueue stays 0                   => frames never match (detection/frame path).
+static std::atomic<uint32_t> flockMatchCount{0};    // inspectWifiFrame().hit()
+static std::atomic<uint32_t> flockEnqueueCount{0};  // successfully rang the buffer
+static std::atomic<uint32_t> flockDrainCount{0};    // dequeued in main loop
+static std::atomic<uint32_t> flockAlertCount{0};    // passed dedup -> siren+log
+
 // callback-safe: copy hit into ring buffer, no allocation/IO
 static inline void enqueueFlockHit(const flockdet::Detection& d) {
     uint8_t w = flockHitWrite.load(std::memory_order_relaxed);
     uint8_t nxt = (uint8_t)((w + 1) % FLOCK_HIT_SLOTS);
     if (nxt == flockHitRead.load(std::memory_order_acquire)) return; // full: drop
+    flockEnqueueCount.fetch_add(1, std::memory_order_relaxed);
     FlockHitRec& r = flockHits[w];
     memcpy(r.mac, d.mac, 6);
     r.rssi = d.rssi;
@@ -187,13 +204,15 @@ static void drainFlockHits() {
         uint8_t r = flockHitRead.load(std::memory_order_relaxed);
         FlockHitRec rec = flockHits[r];
         flockHitRead.store((uint8_t)((r + 1) % FLOCK_HIT_SLOTS), std::memory_order_release);
+        flockDrainCount.fetch_add(1, std::memory_order_relaxed);
 
         if (flockAlreadySeen(rec.mac)) continue;   // one alert per device per session
         flockMarkSeen(rec.mac);
+        flockAlertCount.fetch_add(1, std::memory_order_relaxed);
 
         bool raven = (rec.kind == (uint8_t)flockdet::DeviceKind::RavenDetector);
         Display::showToast(raven ? "RAVEN NEARBY" : "FLOCK CAM NEAR");
-        SFX::play(raven ? SFX::YOU_DIED : SFX::SIREN);
+        SFX::play(raven ? SFX::PIG_RAVEN : SFX::PIG_ALARM);
 
         if (Config::isSDAvailable() && ensureFlockFile()) {
             flockdet::Detection d;
@@ -731,7 +750,10 @@ static void promiscuousCallback(void* buf, wifi_promiscuous_pkt_type_t type) {
     // SD logging are deferred to drainFlockHits() in update()).
     {
         flockdet::Detection fd = g_flockDet.inspectWifiFrame(payload, len, rssi, currentChannel);
-        if (fd.hit()) enqueueFlockHit(fd);
+        if (fd.hit()) {
+            flockMatchCount.fetch_add(1, std::memory_order_relaxed);
+            enqueueFlockHit(fd);
+        }
     }
     
     // Basic network tracking (always happens)
@@ -1057,9 +1079,12 @@ void update() {
     // Process deferred events from callback
     processDeferredEvents();
 
-    // Fire siren + log for any Flock/Raven hits captured this cycle
-    drainFlockHits();
-    
+    // NOTE: Flock hits are NOT drained here anymore. This update() early-returns
+    // whenever NetworkRecon is paused (e.g. WARHOG's active-scan slice) and is
+    // tied to NetworkRecon's lifecycle, which left DO NO HAM silent. The drain
+    // now runs unconditionally from the global app loop via serviceFlockAlerts()
+    // so the siren fires in every sniffing mode.
+
     // Channel hopping
     uint32_t hopInterval = getHopIntervalMsInternal();
     if (!channelLocked.load(std::memory_order_acquire) && now - lastHopTime > hopInterval) {
@@ -1227,6 +1252,35 @@ void setChannel(uint8_t channel) {
     if (channel < 1 || channel > 14) return;
     currentChannel = channel;
     esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
+}
+
+// Drain any Flock/Raven hits and fire the alarm + SD log. Called every frame
+// from the global app loop so it runs in EVERY mode, independent of whether
+// NetworkRecon::update() ran (it early-returns when paused). Cheap when idle:
+// a single relaxed atomic compare when the ring is empty.
+void serviceFlockAlerts() {
+    drainFlockHits();
+
+#if FLOCK_DEBUG_COUNTERS
+    // [TEMP DEBUG — strip once DNH confirmed] print the pipeline counters ~3s,
+    // and only when something changed, so the log isn't spammed.
+    static uint32_t lastPrint = 0;
+    static uint32_t lastMatch = 0, lastEnq = 0, lastDrain = 0, lastAlert = 0;
+    uint32_t now = millis();
+    if (now - lastPrint >= 3000) {
+        uint32_t m = flockMatchCount.load(std::memory_order_relaxed);
+        uint32_t e = flockEnqueueCount.load(std::memory_order_relaxed);
+        uint32_t d = flockDrainCount.load(std::memory_order_relaxed);
+        uint32_t a = flockAlertCount.load(std::memory_order_relaxed);
+        if (m != lastMatch || e != lastEnq || d != lastDrain || a != lastAlert) {
+            Serial.printf("[FLOCK-DBG] match=%u enqueue=%u drain=%u alert=%u recon=%d/%s pkts=%u\n",
+                          m, e, d, a, (int)running, paused ? "paused" : "run",
+                          (unsigned)packetCount.load(std::memory_order_relaxed));
+            lastMatch = m; lastEnq = e; lastDrain = d; lastAlert = a;
+        }
+        lastPrint = now;
+    }
+#endif
 }
 
 void setPacketCallback(PacketCallback callback) {

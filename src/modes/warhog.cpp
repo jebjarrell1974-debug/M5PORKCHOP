@@ -881,10 +881,10 @@ void WarhogMode::processScanResults() {
                 if (Config::isSDAvailable()) appendFlockEntry(fdet, gpsData, hasGPS);
                 if (fdet.kind == flockdet::DeviceKind::RavenDetector) {
                     Display::showToast("RAVEN NEARBY");
-                    SFX::play(SFX::YOU_DIED);   // distinct grave alarm: gunshot detector
+                    SFX::play(SFX::PIG_RAVEN);  // low angry squeal: gunshot detector
                 } else {
                     Display::showToast("FLOCK CAM NEAR");
-                    SFX::play(SFX::SIREN);      // loud police-siren alarm: camera found
+                    SFX::play(SFX::PIG_ALARM);  // pig panic squeal x2: camera found
                 }
             }
         }

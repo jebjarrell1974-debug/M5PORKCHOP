@@ -200,6 +200,17 @@ using PacketCallback = void(*)(const wifi_promiscuous_pkt_t* pkt, wifi_promiscuo
 void setPacketCallback(PacketCallback callback);
 
 /**
+ * @brief Drain queued Flock/Raven detections and fire the alarm + SD log.
+ *
+ * Must be called every frame from the global app loop (main.cpp loop()), NOT
+ * only from update(): update() early-returns when NetworkRecon is paused, which
+ * left passive modes like DO NO HAM silent. This runs mode-independently so the
+ * pig alarm + flock.csv log fire in DNH / OINK / SPECTRUM / WARHOG alike.
+ * Cheap when there is nothing to drain.
+ */
+void serviceFlockAlerts();
+
+/**
  * @brief New network discovery callback type
  * Called from update() when a new network is added to the shared vector
  * Safe to call Mood/XP functions from this callback (runs in main loop context)

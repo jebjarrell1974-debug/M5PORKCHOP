@@ -18,15 +18,12 @@ namespace {
 constexpr float kAlertFt = 1000.0f;  // start ticking at this range
 constexpr float kCloseFt = 300.0f;   // "it can see you" range
 
-constexpr uint16_t kGentleFreq = 2200;  // far-half tick
-constexpr uint16_t kGentleMs   = 90;
-constexpr uint16_t kCloseFreq  = 3000;  // close-range tick: higher and longer
-constexpr uint16_t kCloseMs    = 120;
-
-// Gentle-zone tick spacing, interpolated across kCloseFt..kAlertFt.
-constexpr uint32_t kGentleFastMs = 350;   // at kCloseFt
+// Gentle-zone grunt spacing, interpolated across kCloseFt..kAlertFt.
+constexpr uint32_t kGentleFastMs = 400;   // at kCloseFt (>grunt length, no overlap)
 constexpr uint32_t kGentleSlowMs = 1500;  // at kAlertFt
-constexpr uint32_t kCloseIntervalMs = 250;
+// Inside kCloseFt we loop the full panic squeal; interval must clear its
+// ~0.7s length so the queue never overlaps itself.
+constexpr uint32_t kCloseIntervalMs = 750;
 
 // The map scan is O(kFlockMapCount) integer compares. GPS only moves at ~1 Hz,
 // so re-scanning faster than this buys nothing.
@@ -113,21 +110,21 @@ void update(double lat, double lon, bool valid) {
         Display::showToast("ALPR AHEAD");
     }
 
-    uint32_t interval;
-    uint16_t freq, durMs;
+    uint32_t   interval;
+    SFX::Event tick;
     if (ft <= kCloseFt) {
+        // Inside 300ft: escalate to a looping panic squeal.
         interval = kCloseIntervalMs;
-        freq     = kCloseFreq;
-        durMs    = kCloseMs;
+        tick     = SFX::PIG_SQUEAL;
     } else {
+        // 300-1000ft: low double-grunt that speeds up as the camera nears.
         const float t = (ft - kCloseFt) / (kAlertFt - kCloseFt);   // 0..1
         interval = (uint32_t)(kGentleFastMs + t * (float)(kGentleSlowMs - kGentleFastMs));
-        freq     = kGentleFreq;
-        durMs    = kGentleMs;
+        tick     = SFX::PIG_GRUNT;
     }
 
     if (g_lastToneMs == 0 || now - g_lastToneMs >= interval) {
-        SFX::tone(freq, durMs);
+        SFX::play(tick);
         g_lastToneMs = now;
     }
 }
