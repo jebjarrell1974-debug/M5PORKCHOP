@@ -90,22 +90,23 @@ private:
     static bool seenContains(const uint8_t seen[][6], uint8_t n, const uint8_t* mac);
 
     // ---- Eye-Spy radio rotation (P5) ---------------------------------------
-    // One 2.4GHz radio, time-shared. BLE slice: NimBLE passive scan, WiFi off.
-    // WiFi slice: BLE scan stopped, our own PASSIVE promiscuous sniff feeding
-    // NetworkRecon::inspectDefenseFrame (flock / attack / evil-twin). We keep
-    // NimBLE initialised the whole time (never deinit) to dodge the ESP32-S3
-    // re-init trap; only the SCAN starts/stops. No TX in either slice.
+    // One 2.4GHz radio, time-shared. Only ONE stack's controller is ever up at a
+    // time -- this is mandatory: bringing WiFi up while the BT controller is
+    // still enabled aborts in coex_enable() (confirmed by coredump). So each
+    // handoff fully tears the other radio down:
+    //   BLE slice  : NimBLE inited + passive scan, WiFi/NetworkRecon stopped.
+    //   WiFi slice : NimBLE DEINITED, NetworkRecon::start() owns WiFi promiscuous
+    //                (its callback feeds flock/attack/evil-twin; the global
+    //                serviceFlockAlerts drains + alerts). NetworkRecon::start()
+    //                is the proven coex-safe bring-up (it deinits BLE itself).
+    // No TX in either slice (passive scan / passive promiscuous).
     enum class RadioPhase : uint8_t { BleSlice = 0, WifiSlice };
     static const uint32_t BLE_SLICE_MS  = 9000;
     static const uint32_t WIFI_SLICE_MS = 8000;
-    static const uint32_t WIFI_HOP_MS   = 300;
     static RadioPhase radioPhase;
     static uint32_t   phaseStartMs;
-    static uint32_t   lastHopMs;
-    static bool       wifiSniffing;
     static void enterBleSlice();
     static void enterWifiSlice();
-    static void serviceWifiSlice(uint32_t now);
 
     // ---- fused score --------------------------------------------------------
     static WatchState watch;

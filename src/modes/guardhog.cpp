@@ -13,7 +13,6 @@
 #include <M5Cardputer.h>
 #include <NimBLEDevice.h>
 #include <WiFi.h>
-#include <esp_wifi.h>
 #include <SD.h>
 #include <math.h>
 #include <string.h>
@@ -42,27 +41,10 @@ volatile uint8_t GuardHogMode::sightRead = 0;
 
 GuardHogMode::RadioPhase GuardHogMode::radioPhase = GuardHogMode::RadioPhase::BleSlice;
 uint32_t GuardHogMode::phaseStartMs = 0;
-uint32_t GuardHogMode::lastHopMs = 0;
-bool GuardHogMode::wifiSniffing = false;
 WatchState GuardHogMode::watch = WatchState::Calm;
 
 static const uint32_t TRACKER_STALE_MS = 30000;   // drop from list after 30s unseen
 static char ghLogFile[128] = {0};
-
-// WiFi promiscuous slice: current hop channel + the rx callback.
-static const uint8_t GH_HOPS[] = {1, 6, 11};
-static uint8_t ghHopIdx = 0;
-static volatile uint8_t ghChannel = 1;
-
-static void ghPromiscCb(void* buf, wifi_promiscuous_pkt_type_t type) {
-    if (!buf) return;
-    if (type == WIFI_PKT_MISC) return;
-    const wifi_promiscuous_pkt_t* pkt = (const wifi_promiscuous_pkt_t*)buf;
-    uint16_t len = pkt->rx_ctrl.sig_len;
-    if (len > 4) len -= 4;   // strip ESP32 ghost FCS bytes
-    if (len < 24) return;
-    NetworkRecon::inspectDefenseFrame(pkt->payload, len, pkt->rx_ctrl.rssi, ghChannel);
-}
 
 // ============================================================================
 // BLE scan callback (runs in NimBLE task context — keep it cheap)
@@ -112,14 +94,11 @@ void GuardHogMode::start() {
 
     watch = WatchState::Calm;
 
-    // Take the radio away from the background WiFi engine. GUARD HOG owns it and
-    // time-shares BLE/WiFi itself via the Eye-Spy rotation.
+    // GUARD HOG owns the radio and time-shares it. Start clean: stop the WiFi
+    // engine, then begin the BLE slice (which brings NimBLE up with WiFi down).
     NetworkRecon::stop();
-    WiFi.mode(WIFI_OFF);
-    delay(20);
-
     running = true;
-    enterBleSlice();   // start in the BLE slice
+    enterBleSlice();
 
     Avatar::setState(AvatarState::HUNTING);
     Display::notify(NoticeKind::STATUS, "GUARD HOG - WATCHING", 4000, NoticeChannel::TOP_BAR);
@@ -129,63 +108,45 @@ void GuardHogMode::stop() {
     if (!running) return;
     running = false;
 
-    // Tear down whichever slice is live.
-    if (wifiSniffing) {
-        esp_wifi_set_promiscuous(false);
-        esp_wifi_set_promiscuous_rx_cb(nullptr);
-        wifiSniffing = false;
-    }
     stopBleScan();
-
-    // Give BLE back and restore the WiFi recon engine for other modes.
-    WiFi.mode(WIFI_STA);
-    delay(50);
-    NetworkRecon::start();
+    // Only ONE controller may be up when WiFi restarts. If BLE is still inited,
+    // NetworkRecon::start() will deinit it as part of its coex-safe bring-up.
+    NetworkRecon::start();   // restore background WiFi recon for other modes
     Avatar::setState(AvatarState::NEUTRAL);
 }
 
 // ---- Eye-Spy radio rotation ------------------------------------------------
+// Only ONE radio's controller is ever enabled at a time. Bringing WiFi up while
+// the BT controller is still enabled aborts in coex_enable() (coredump-proven),
+// so each handoff fully tears the other radio down before enabling the next.
 void GuardHogMode::enterBleSlice() {
-    // Leave the WiFi slice if we were in it.
-    if (wifiSniffing) {
-        esp_wifi_set_promiscuous(false);
-        esp_wifi_set_promiscuous_rx_cb(nullptr);
-        wifiSniffing = false;
-    }
+    // Coming from the WiFi slice: stop WiFi promiscuous + free the WiFi driver so
+    // the BT controller can own the radio.
+    NetworkRecon::stop();
     WiFi.mode(WIFI_OFF);
-    delay(10);
-    startBleScan();
+    delay(30);              // let WiFi/coex fully tear down before BLE comes up
+    startBleScan();         // (re)inits NimBLE + starts the passive scan
     radioPhase = RadioPhase::BleSlice;
     phaseStartMs = millis();
     Serial.printf("[GH] -> BLE slice @ %lums\n", (unsigned long)phaseStartMs);
 }
 
 void GuardHogMode::enterWifiSlice() {
-    // Stop the BLE scan (keep NimBLE initialised) and bring WiFi up passively.
+    // Stop + FULLY tear down BLE (deinit the controller) before WiFi starts, or
+    // coex_enable() aborts. NetworkRecon::start() then does the proven coex-safe
+    // WiFi promiscuous bring-up (it also deinits NimBLE if still inited); its
+    // callback feeds flock/attack/evil-twin and the global serviceFlockAlerts
+    // drains + alerts. No GUARD-HOG-owned promiscuous callback needed.
     stopBleScan();
-    WiFi.mode(WIFI_STA);
-    WiFi.disconnect(false, true);
-    delay(10);
-    ghHopIdx = 0;
-    ghChannel = GH_HOPS[0];
-    esp_wifi_set_promiscuous_rx_cb(ghPromiscCb);
-    esp_wifi_set_promiscuous_filter(nullptr);
-    esp_wifi_set_promiscuous(true);
-    esp_wifi_set_channel(ghChannel, WIFI_SECOND_CHAN_NONE);
-    wifiSniffing = true;
+    if (NimBLEDevice::isInitialized()) {
+        NimBLEDevice::deinit(true);
+    }
+    bleStarted = false;
+    delay(30);              // let the BT controller fully release the radio
+    NetworkRecon::start();
     radioPhase = RadioPhase::WifiSlice;
     phaseStartMs = millis();
-    lastHopMs = phaseStartMs;
     Serial.printf("[GH] -> WiFi slice @ %lums\n", (unsigned long)phaseStartMs);
-}
-
-void GuardHogMode::serviceWifiSlice(uint32_t now) {
-    if (now - lastHopMs >= WIFI_HOP_MS) {
-        ghHopIdx = (uint8_t)((ghHopIdx + 1) % (sizeof(GH_HOPS) / sizeof(GH_HOPS[0])));
-        ghChannel = GH_HOPS[ghHopIdx];
-        esp_wifi_set_channel(ghChannel, WIFI_SECOND_CHAN_NONE);
-        lastHopMs = now;
-    }
 }
 
 void GuardHogMode::startBleScan() {
@@ -258,11 +219,11 @@ void GuardHogMode::update() {
     processSightings();
     ageTrackers();
 
-    // Eye-Spy rotation.
+    // Eye-Spy rotation. During the WiFi slice NetworkRecon owns the radio and
+    // hops channels itself, so there is nothing to service here.
     if (radioPhase == RadioPhase::BleSlice) {
         if (now - phaseStartMs >= BLE_SLICE_MS) enterWifiSlice();
     } else {
-        serviceWifiSlice(now);
         if (now - phaseStartMs >= WIFI_SLICE_MS) enterBleSlice();
     }
 
